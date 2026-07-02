@@ -85,7 +85,30 @@ def _build_service() -> RouterService:
         local_client = HttpLocalClient(manager_url, tls=_local_tls_from_env())
     else:
         local_client = _try_embedded_manager()
-    return RouterService.create(memory=_default_memory(), local_client=local_client)
+    return RouterService.create(
+        memory=_default_memory(), local_client=local_client, authorizer=_spend_authorizer_from_env()
+    )
+
+
+def _spend_authorizer_from_env():
+    """Select the direct-to-user spend authorizer (deterministic money gate).
+
+    Default DENY (fail-closed) — a real deployment should wire a CallbackSpendAuthorizer
+    to its own user-facing confirmation UI. `console` prompts on the terminal (only safe
+    when NOT running the MCP stdio server on that terminal); `auto` approves everything
+    (trusted automation only)."""
+    mode = os.environ.get("AGENTCONNECT_SPEND_AUTHORIZER", "deny").lower()
+    if mode == "auto":
+        from ..common.authorization import AutoApproveSpendAuthorizer
+
+        return AutoApproveSpendAuthorizer()
+    if mode == "console":
+        from ..common.authorization import ConsoleSpendAuthorizer
+
+        return ConsoleSpendAuthorizer()
+    from ..common.authorization import DenyingSpendAuthorizer
+
+    return DenyingSpendAuthorizer()
 
 
 def build_mcp_server(service: Optional[RouterService] = None):
@@ -172,6 +195,23 @@ def build_mcp_server(service: Optional[RouterService] = None):
         """Learned per-provider scorecards (success rate, latency, cost, sample
         count) and the current learned-quality signal folded into routing (Phase 6)."""
         return _json(svc.get_provider_scorecards())
+
+    @mcp.tool()
+    def set_budget(amount_usd: float, period: str = "monthly") -> str:
+        """Set the global spend budget: a dollar amount over a period
+        ('daily' | 'weekly' | 'monthly'). The router paces spend to it and hard-stops
+        paid/rented routes when it is exhausted. This is the ONLY way to set it — there
+        is no default. Returns the resulting budget status."""
+        return _json(svc.set_budget(amount_usd, period))
+
+    @mcp.tool()
+    def get_budget_status() -> str:
+        """Current spend-budget status: amount, period, window, spent, remaining,
+        pace, projection, and on_track. If it reports configured=false with
+        action_required='set_budget', you MUST ask the user for a budget (amount +
+        period) and call set_budget before any paid-cloud or rented-GPU work — the
+        router keeps those disabled until then."""
+        return _json(svc.get_budget_status())
 
     @mcp.tool()
     def promote_task(task_id: str) -> str:

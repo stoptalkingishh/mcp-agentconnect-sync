@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..common import privacy as privacy_mod
+from ..common.authorization import ChargeRequest, DenyingSpendAuthorizer, SpendAuthorizer
+from ..common.budget import BudgetManager
 from ..common.evaluation import Evaluator
 from ..common.config import ProfilesConfig, RoutingConfig, load_all
 from ..common.memory import SharedMemory
@@ -61,6 +63,11 @@ class RouterService:
     evaluator: Optional[Evaluator] = None
     # Warm-node reuse for rented GPUs (Goal 4 amortization).
     node_pool: Optional["NodePool"] = None
+    # Global spend budget (mandatory, no silent default).
+    budget: Optional[BudgetManager] = None
+    # Direct-to-user spend authorization (deterministic human gate). Default denies,
+    # so paid/rented spend is disabled until a real user-facing authorizer is wired.
+    authorizer: Optional[SpendAuthorizer] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -71,6 +78,7 @@ class RouterService:
         gateway: Optional[ProviderGateway] = None,
         provisioner: Optional["NodeProvisioner"] = None,
         rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None,
+        authorizer: Optional[SpendAuthorizer] = None,
     ) -> "RouterService":
         providers_cfg, profiles, routing_cfg = load_all()
         mem = memory or SharedMemory()
@@ -90,6 +98,8 @@ class RouterService:
             rented_client_factory=rented_client_factory,
             evaluator=Evaluator(mem, min_samples=min_samples),
             node_pool=NodePool(),
+            budget=BudgetManager(mem, routing_cfg),
+            authorizer=authorizer or DenyingSpendAuthorizer(),
         )
 
     # ----------------------------------------------------------- evaluation
@@ -260,7 +270,7 @@ class RouterService:
         # Refresh the learned-quality prior from observed outcomes (Phase 6).
         if self.evaluator is not None:
             self.engine.set_learned_quality(self.evaluator.learned_quality())
-        decision = self.engine.route(ctx, status)
+        decision = self._route_with_budget_prompt(ctx, status)
         self.memory.record_routing_decision(task_id, decision.model_dump(mode="json"))
         self.memory.append_log(
             task_id, f"routing_decision={decision.decision} provider={decision.selected_provider} "
@@ -269,18 +279,41 @@ class RouterService:
 
         if decision.selected_provider is None:
             self._transition(task_id, state, TaskState.REJECTED)
+            reasons = {r.reason for r in decision.rejected_options}
+            if "budget_not_configured" in reasons:
+                # The user was prompted directly (via the authorizer) and no budget was
+                # set — deterministic, not left to the stochastic agent.
+                summary = "No eligible provider: paid/rented need a spend budget, and none was set."
+                next_action = (
+                    "The user declined / no budget is set. Set one via set_budget, or run the "
+                    "task on free/local providers."
+                )
+            else:
+                summary = f"No eligible provider ({decision.decision})."
+                next_action = "Relax constraints, sanitize the payload, or wait for quota/capacity."
             self.memory.update_task(
-                task_id, state=TaskState.REJECTED.value,
-                summary=f"No eligible provider ({decision.decision}).",
-                recommended_next_action="Relax constraints, sanitize the payload, or wait for quota/capacity.",
+                task_id, state=TaskState.REJECTED.value, summary=summary,
+                recommended_next_action=next_action,
             )
             return self._summary(task_id)
 
-        state = self._transition(task_id, state, TaskState.QUEUED)
-
-        # 13. Reserve quota / admit locally, then 14. dispatch.
         cfg = self.registry.get(decision.selected_provider)
         assert cfg is not None
+
+        # Deterministic per-charge user confirmation for real-money routes, BEFORE
+        # queueing (so a decline is a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED).
+        if cfg.privacy == "external_paid" or RoutingEngine._is_rented(cfg):
+            if not self._confirm_charge(cfg, ctx, submission.task, task_id):
+                self._transition(task_id, state, TaskState.REJECTED)
+                self.memory.update_task(
+                    task_id, state=TaskState.REJECTED.value,
+                    summary="Spend not confirmed by the user.",
+                    recommended_next_action="Approve the charge when prompted, adjust the budget, "
+                    "or resubmit constrained to free/local providers.",
+                )
+                return self._summary(task_id)
+
+        # 13. Reserve cloud quota (pre-queue so a denial is a legal REJECTED).
         reservation = None
         if cfg.type == "cloud":
             reservation = self.quota.reserve(cfg, task_id, in_tok, out_tok)
@@ -293,6 +326,7 @@ class RouterService:
                 )
                 return self._summary(task_id)
 
+        state = self._transition(task_id, state, TaskState.QUEUED)
         state = self._transition(task_id, state, TaskState.DISPATCHED)
         state = self._transition(task_id, state, TaskState.RUNNING)
 
@@ -385,12 +419,97 @@ class RouterService:
 
     def get_router_status(self) -> dict[str, Any]:
         status = self._local_status()
+        budget_brief = None
+        if self.budget is not None:
+            configured = self.budget.is_configured()
+            budget_brief = {
+                "configured": configured,
+                "action_required": None if configured or not self.budget.require_explicit else "set_budget",
+            }
         return {
             "policy_version": self.registry.policy_version,
             "providers": [p.provider_id for p in self.registry.all()],
             "local_manager": status.model_dump(mode="json") if status else None,
             "output_policy": self.routing_cfg.mcp_output_policy,
+            "budget": budget_brief,
         }
+
+    # ------------------------------------------------------------- budget
+    def set_budget(self, amount_usd: float, period: str = "monthly") -> dict[str, Any]:
+        """Set the global spend budget (amount + daily/weekly/monthly period). This
+        is the ONLY way to set it — there is no default. Persisted across restarts."""
+        if self.budget is None:
+            return {"error": "budget_manager_unavailable"}
+        try:
+            self.budget.set(amount_usd, period)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return self.budget.status(time.time())
+
+    def get_budget_status(self) -> dict[str, Any]:
+        if self.budget is None:
+            return {"configured": False, "error": "budget_manager_unavailable"}
+        return self.budget.status(time.time())
+
+    # ---------------------------------------------------- routing + spend gate
+    def _refresh_budget_state(self) -> None:
+        if self.budget is not None:
+            now = time.time()
+            self.engine.set_budget_state(
+                self.budget.is_configured(), self.budget.remaining(now),
+                self.budget.pressure(now), self.budget.require_explicit,
+            )
+
+    def _route_with_budget_prompt(self, ctx: RoutingContext, status) -> RoutingDecision:
+        """Route; if the only blocker is a missing budget, prompt the USER directly
+        (via the authorizer) to set one and route once more — never delegating the
+        money decision to the stochastic agent."""
+        decision = None
+        for attempt in range(2):
+            self._refresh_budget_state()
+            decision = self.engine.route(ctx, status)
+            if decision.selected_provider is not None:
+                return decision
+            reasons = {r.reason for r in decision.rejected_options}
+            if (
+                attempt == 0
+                and "budget_not_configured" in reasons
+                and self.budget is not None
+                and self.authorizer is not None
+            ):
+                got = self.authorizer.request_budget(self.budget.suggested_period)
+                if got and got.get("amount_usd", 0) > 0:
+                    try:
+                        self.budget.set(got["amount_usd"], got.get("period", self.budget.suggested_period))
+                        continue  # re-route now that a budget exists
+                    except ValueError:
+                        pass
+            break
+        return decision
+
+    def _confirm_charge(self, cfg, ctx: RoutingContext, task_text: str, task_id: str) -> bool:
+        """Ask the user (directly, via the authorizer) to approve THIS charge."""
+        now = time.time()
+        if RoutingEngine._is_rented(cfg):
+            r = cfg.rental
+            cost = (r.max_hourly_usd * (r.min_rental_seconds / 3600.0)) if r else 0.0
+            kind = "rented_gpu"
+        else:
+            cost = self.quota.estimate_cost_usd(cfg, ctx.est_input_tokens, ctx.est_output_tokens)
+            kind = "paid_cloud"
+        configured = self.budget is not None and self.budget.is_configured()
+        req = ChargeRequest(
+            provider=cfg.provider_id, kind=kind, estimated_cost_usd=cost,
+            task_summary=task_text[:120],
+            period=self.budget.config().period if configured else None,
+            budget_amount_usd=self.budget.config().amount_usd if configured else None,
+            remaining_usd=self.budget.remaining(now) if configured else None,
+        )
+        approved = self.authorizer.confirm_charge(req) if self.authorizer is not None else False
+        self.memory.append_log(
+            task_id, f"spend_confirmation provider={cfg.provider_id} est_cost={cost:.4f} approved={approved}"
+        )
+        return approved
 
     def get_provider_status(self) -> list[dict[str, Any]]:
         out = []

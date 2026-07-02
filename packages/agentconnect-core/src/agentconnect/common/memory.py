@@ -85,10 +85,16 @@ CREATE TABLE IF NOT EXISTS evaluations (
     retries      INTEGER DEFAULT 0,
     created_at   REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,     -- json
+    updated_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_logs_task ON logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_quota_provider ON quota_records(provider);
 CREATE INDEX IF NOT EXISTS idx_eval_provider ON evaluations(provider);
+CREATE INDEX IF NOT EXISTS idx_quota_created ON quota_records(created_at);
 """
 
 
@@ -328,6 +334,30 @@ class SharedMemory:
             (provider, since_epoch),
         ).fetchone()
         return {"requests": row["requests"], "tokens": row["tokens"], "cost": row["cost"]}
+
+    def total_spend_since(self, since_epoch: float) -> float:
+        """All-provider committed spend (USD) since an epoch — the global budget's
+        meter. Free/local rows contribute $0, so this equals paid-cloud + rented
+        spend. Excludes uncommitted reservations."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(act_cost_usd),0) AS cost"
+            " FROM quota_records WHERE created_at>=? AND status!='reserved'",
+            (since_epoch,),
+        ).fetchone()
+        return float(row["cost"])
+
+    # -------------------------------------------------------------- settings
+    def set_setting(self, key: str, value: dict[str, Any]) -> None:
+        self._conn.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, json.dumps(value), _now()),
+        )
+        self._conn.commit()
+
+    def get_setting(self, key: str) -> Optional[dict[str, Any]]:
+        row = self._conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else None
 
 
 def _snippet(text: Optional[str], query: str, width: int = 120) -> str:

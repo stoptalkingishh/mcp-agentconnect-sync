@@ -25,7 +25,11 @@ from agentconnect.router.service import RouterService
 def engine():
     mem = SharedMemory()
     reg = ProviderRegistry.from_config(load_providers())
-    return RoutingEngine(reg, load_profiles(), load_routing(), QuotaLedger(memory=mem))
+    eng = RoutingEngine(reg, load_profiles(), load_routing(), QuotaLedger(memory=mem))
+    # A budget must be configured for paid/rented to be eligible (mandatory-prompt
+    # policy). Give the engine ample headroom for the rented-routing tests.
+    eng.set_budget_state(configured=True, remaining_usd=1000.0, pressure=0.0, require_explicit=True)
+    return eng
 
 
 def _ctx(privacy, **kw):
@@ -95,10 +99,14 @@ def test_end_to_end_rented_dispatch_and_billing():
     mem = SharedMemory()
     # Inject an in-process client so the "rented" node runs the stub backend offline.
     factory = lambda cfg, handle: InProcessLocalClient(ResidencyManager())
+    from agentconnect.common.authorization import AutoApproveSpendAuthorizer
+
     svc = RouterService.create(
         memory=mem, local_client=None,
         provisioner=StubProvisioner(), rented_client_factory=factory,
+        authorizer=AutoApproveSpendAuthorizer(),  # auto-confirm charges in tests
     )
+    svc.set_budget(50.0, "monthly")  # rented needs a configured budget
     sub = TaskSubmission(
         task="Reason over this large private design doc.",
         agent_type="repo_scout",

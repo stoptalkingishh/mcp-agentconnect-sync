@@ -72,9 +72,41 @@ class RoutingEngine:
         # provider_id -> bounded [-1,1] learned-quality signal (Phase 6). Refreshed
         # by the service from observed outcomes before each routing pass.
         self._learned: dict[str, float] = {}
+        # Global spend-budget snapshot, refreshed by the service each pass. Default
+        # is "not configured" -> paid/rented fail closed (mandatory-prompt policy).
+        self._budget: dict = {
+            "configured": False, "remaining_usd": 0.0, "pressure": 0.0, "require_explicit": True,
+        }
 
     def set_learned_quality(self, learned: dict[str, float]) -> None:
         self._learned = dict(learned or {})
+
+    def set_budget_state(
+        self, configured: bool, remaining_usd: float, pressure: float, require_explicit: bool
+    ) -> None:
+        self._budget = {
+            "configured": bool(configured),
+            "remaining_usd": float(remaining_usd),
+            "pressure": float(pressure),
+            "require_explicit": bool(require_explicit),
+        }
+
+    # --------------------------------------------------------------- budget
+    def _call_cost(self, cfg: ProviderConfig, ctx: RoutingContext) -> float:
+        if self._is_rented(cfg):
+            r = cfg.rental
+            return (r.max_hourly_usd * (r.min_rental_seconds / 3600.0)) if r else 0.0
+        return self.quota.estimate_cost_usd(cfg, ctx.est_input_tokens, ctx.est_output_tokens)
+
+    def _budget_gate(self, cfg: ProviderConfig, ctx: RoutingContext) -> Optional[str]:
+        """Global spend-budget hard gate for paid/rented providers. Returns a
+        rejection reason or None. Layered on top of per-provider caps."""
+        b = self._budget
+        if b["require_explicit"] and not b["configured"]:
+            return "budget_not_configured"
+        if b["configured"] and self._call_cost(cfg, ctx) > b["remaining_usd"] + 1e-9:
+            return "period_budget_exhausted"
+        return None
 
     # ------------------------------------------------------------- profile
     def resolve_local_model(self, ctx: RoutingContext, status: ManagerStatus) -> ModelChoice:
@@ -187,6 +219,10 @@ class RoutingEngine:
             ok, reason = self.quota.can_reserve(cfg, ctx.est_input_tokens, ctx.est_output_tokens)
             if not ok:
                 return False, reason
+            if cfg.privacy == "external_paid":
+                gate = self._budget_gate(cfg, ctx)
+                if gate:
+                    return False, gate
         elif self._is_rented(cfg):
             # Rented node: provisioned on demand, so no live ManagerStatus is
             # required at routing time. Enforce trust policy + rental budget.
@@ -195,6 +231,9 @@ class RoutingEngine:
             ok, reason = self.quota.can_reserve_rental(cfg)
             if not ok:
                 return False, reason
+            gate = self._budget_gate(cfg, ctx)
+            if gate:
+                return False, gate
         elif cfg.type == "local":
             if status is None:
                 return False, "local_manager_status_unavailable"
@@ -288,6 +327,13 @@ class RoutingEngine:
         # Learned-quality prior from observed outcomes (Phase 6). Bounded [-1,1],
         # so it tilts close calls without overriding hard constraints or dominating.
         terms["learned_quality"] = self._learned.get(cfg.provider_id, 0.0) * w.get("learned_quality", 1.0)
+
+        # Budget pace pressure: as spend runs ahead of pace / nears the cap, steer
+        # paid & rented down so the router prefers free/local (soft even-burn).
+        if self._budget.get("configured") and (cfg.privacy == "external_paid" or self._is_rented(cfg)):
+            terms["budget_pressure_penalty"] = -self._budget["pressure"] * w.get("budget_pressure_penalty", 3.0)
+        else:
+            terms["budget_pressure_penalty"] = 0.0
 
         total = round(sum(terms.values()), 4)
         return ScoreBreakdown(provider=cfg.provider_id, model=model_id, total=total, terms=terms)

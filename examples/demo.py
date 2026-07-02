@@ -30,12 +30,21 @@ def show(title: str, obj: object) -> None:
 
 
 def main() -> None:
+    from agentconnect.common.authorization import CallbackSpendAuthorizer
+
+    # A direct-to-user spend gate. In a real app this pops a native confirmation UI;
+    # here we auto-approve and print, to show the deterministic money gate firing.
+    def confirm(req):
+        print(f"   [user spend prompt] {req.describe()} -> APPROVED")
+        return True
+
     # Inject an in-process client for the "rented" node too, so Goal 4 runs offline.
     rented_factory = lambda cfg, handle: InProcessLocalClient(ResidencyManager())
     svc = RouterService.create(
         memory=SharedMemory(),  # in-memory; use a path to persist
         local_client=InProcessLocalClient(ResidencyManager()),
         rented_client_factory=rented_factory,
+        authorizer=CallbackSpendAuthorizer(confirm),
     )
 
     show("router status", svc.get_router_status())
@@ -75,7 +84,12 @@ def main() -> None:
     )
     show("task 3 summary (secret_sensitive → blocked)", s3.model_dump(mode="json"))
 
-    # 4) A very large private reasoning task -> rented GPU node (opt-in + trust).
+    # Budget is mandatory before any paid/rented spend — no silent default.
+    show("budget status (before setting)", svc.get_budget_status())
+    show("set budget $25/month", svc.set_budget(25.0, "monthly"))
+
+    # 4) Even with a budget + allow_rented, an owned local node is free and wins —
+    #    so this stays local and NO spend/confirmation is needed (correct behavior).
     s4 = svc.submit_task(
         TaskSubmission(
             task="Reason over this large private architecture doc and propose a refactor.",
@@ -85,8 +99,27 @@ def main() -> None:
             ),
         )
     )
-    show("task 4 summary (repo_sensitive + allow_rented → rented node)", s4.model_dump(mode="json"))
-    show("task 4 routing decision", svc.memory.get_routing_decisions(s4.task_id)[-1])
+    show("task 4 routing decision (owned local wins, free)", svc.memory.get_routing_decisions(s4.task_id)[-1])
+
+    # 5) Same task on a node WITHOUT an owned local box -> rented GPU is the only
+    #    option. The direct spend gate prompts the user (see the stdout line).
+    rented_only = RouterService.create(
+        memory=SharedMemory(), local_client=None,
+        rented_client_factory=rented_factory,
+        authorizer=CallbackSpendAuthorizer(confirm),
+    )
+    rented_only.set_budget(25.0, "monthly")
+    s5 = rented_only.submit_task(
+        TaskSubmission(
+            task="Reason over this large private doc on rented hardware.",
+            agent_type="repo_scout",
+            constraints=TaskConstraints(
+                privacy_class="repo_sensitive", allow_external=False, allow_rented=True
+            ),
+        )
+    )
+    show("task 5 summary (rented; user-approved spend)", s5.model_dump(mode="json"))
+    show("task 5 budget status (spend accrued)", rented_only.get_budget_status())
 
     show("provider status", svc.get_provider_status())
     # Phase 6: learned scorecards accumulated from the dispatches above.

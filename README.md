@@ -123,6 +123,8 @@ Register the router with Claude Code (`.mcp.json`):
 | `get_log_slice(task_id, level, query, max_lines)` | bounded log slice |
 | `search_memory(query, scope, limit)` | snippets (never full bodies) |
 | `get_router_status()` / `get_provider_status()` | policy + live provider/quota state |
+| `get_provider_scorecards()` | learned per-provider quality/latency (Phase 6) |
+| `set_budget(amount_usd, period)` / `get_budget_status()` | global spend budget + pacing |
 | `promote_task(task_id)` / `cancel_task(task_id)` | control |
 
 ## Context virtualization
@@ -151,6 +153,27 @@ manager, used solely to rent/terminate the box. A `repo_sensitive` task may run 
 a rented node only with explicit opt-in (`allow_rented`) **and** when the node
 meets its trust policy (ephemeral, encrypted, your image, no external logging).
 
+## Spend budget & direct user authorization (fail-closed on money)
+
+Set one number and a period — `set_budget(amount_usd, "daily"|"weekly"|"monthly")` —
+and the router **paces** spend against it: as cumulative spend runs ahead of the
+even-burn line (or nears the cap) it steers toward free/local via a scoring penalty,
+and it hard-blocks paid/rented when the period budget is exhausted. Spend is metered
+across all real money (paid cloud + rented GPU) from the one `quota_records` ledger.
+
+Two deliberate safety properties:
+
+- **Mandatory, no silent default.** There is no default amount. Until the user
+  explicitly sets a budget, paid cloud and rented GPU are **ineligible** — the system
+  still runs fully on free-tier/owned-local, but real money is off until asked for.
+- **Deterministic human gate on every charge.** Money never depends on the stochastic
+  agent. The router calls a `SpendAuthorizer` *directly*: `request_budget` prompts the
+  user to set a budget when none exists, and `confirm_charge` asks the user to approve
+  **each** paid/rented charge before it happens. The default is `Deny` (fail-closed);
+  wire `CallbackSpendAuthorizer` to your app's native confirmation UI, or use
+  `Console`/`AutoApprove` for CLI/trusted automation. This bounds the "stochastic blast
+  zone": the agent can propose work, but the user approves the spend.
+
 ## Privacy & secrets (fail-closed)
 
 - Tasks are classified into `public / low_sensitive / repo_sensitive /
@@ -166,7 +189,11 @@ meets its trust policy (ephemeral, encrypted, your image, no external logging).
 
 ## Status vs. the phased plan (§25)
 
-**All six phases implemented end-to-end (offline, tested — 53 tests):** the
+A **global spend budget** with even-burn pacing and a **direct-to-user spend
+authorizer** (mandatory budget, per-charge confirmation — money never rides on the
+agent) sit on top of all six phases.
+
+**All six phases implemented end-to-end (offline, tested — 72 tests):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and

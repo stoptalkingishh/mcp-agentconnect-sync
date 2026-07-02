@@ -69,8 +69,20 @@ scoring:
     # Learned-quality prior from observed outcomes (Phase 6). Bounded [-1,1] signal
     # * this weight; kept modest so it tilts close calls, never dominates.
     learned_quality: 1.5
+    # Global spend-budget pace pressure (see `budget` below). [0,1] pressure * weight
+    # steers paid/rented down as spend nears the cap or runs ahead of pace.
+    budget_pressure_penalty: 3.0
   # Minimum observations before a provider's learned signal is used at all.
   learned_min_samples: 5
+
+# --- Global spend budget: policy only, NO amount (handoff budget feature) --------
+# The amount + period are set by the user at runtime via the set_budget MCP tool and
+# persisted in shared memory. There is deliberately NO default amount here: until the
+# user explicitly sets a budget, paid cloud and rented GPU are disabled (fail-closed)
+# and the router asks the manager agent to prompt for one.
+budget:
+  require_explicit: true        # paid/rented ineligible until a budget is set
+  suggested_period: monthly     # daily | weekly | monthly (hint for the prompt)
   # A resident-model task pays no switch penalty; a specialist that is not loaded
   # pays the full model_switch_penalty unless the batch threshold is met.
   quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains

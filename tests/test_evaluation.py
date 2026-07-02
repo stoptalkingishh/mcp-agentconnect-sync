@@ -70,10 +70,14 @@ def test_failed_dispatch_recorded_as_failure():
 
     from agentconnect.router.provisioning import StubProvisioner
 
+    from agentconnect.common.authorization import AutoApproveSpendAuthorizer
+
     svc = RouterService.create(
         memory=SharedMemory(), local_client=None,
         provisioner=StubProvisioner(), rented_client_factory=boom_factory,
+        authorizer=AutoApproveSpendAuthorizer(),
     )
+    svc.set_budget(50.0, "monthly")  # rented needs a configured budget
     summary = svc.submit_task(
         TaskSubmission(task="huge private reasoning job", agent_type="repo_scout",
                        constraints=TaskConstraints(privacy_class="repo_sensitive",

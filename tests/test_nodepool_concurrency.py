@@ -30,10 +30,14 @@ def _rented_svc():
 
     prov.provision = counting_provision  # type: ignore[method-assign]
     factory = lambda cfg, handle: InProcessLocalClient(ResidencyManager())
+    from agentconnect.common.authorization import AutoApproveSpendAuthorizer
+
     svc = RouterService.create(
         memory=SharedMemory(), local_client=None,
         provisioner=prov, rented_client_factory=factory,
+        authorizer=AutoApproveSpendAuthorizer(),
     )
+    svc.set_budget(50.0, "monthly")  # rented needs a configured budget
     return svc, calls
 
 

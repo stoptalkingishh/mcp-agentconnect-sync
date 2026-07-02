@@ -182,6 +182,32 @@ agents can't oversubscribe a shared free tier; committed usage is persisted to
 shared memory and is what daily-limit math reads. Paid providers additionally
 enforce `max_daily_spend_usd`.
 
+## Global spend budget + direct user authorization
+
+Two layers govern real money (paid cloud + rented GPU); free/owned-local are always $0.
+
+**Budget & pacing** (`common/budget.py`, `common/memory.py`). `BudgetManager` reads a
+single user-set budget (`settings["budget"]`: amount + daily/weekly/monthly) and meters
+it against `total_spend_since(period_start)` — the all-provider sum of committed
+`act_cost_usd`. It exposes `remaining`, `paced_allowance` (straight-line even-burn),
+`pressure` ∈ [0,1] (max of cap-proximity and ahead-of-pace), and `can_afford`. The
+service refreshes a snapshot into the engine each pass (`set_budget_state`), which adds a
+hard eligibility gate (`period_budget_exhausted`) and a soft `budget_pressure_penalty`
+scoring term for paid/rented. **Mandatory, no silent default:** there is no default
+amount; until the user sets one, paid/rented are rejected `budget_not_configured` and the
+system runs on free/local only.
+
+**Direct user authorization** (`common/authorization.py`). Money decisions are kept off
+the stochastic agent. The service calls a `SpendAuthorizer` directly: `request_budget`
+(prompt the user to set a budget when none exists — deterministic, then the router
+re-routes) and `confirm_charge` (approve *each* paid/rented charge before it happens).
+The default `DenyingSpendAuthorizer` is fail-closed (no channel wired → no spend);
+deployments wire `CallbackSpendAuthorizer` to a native UI, or use `Console`/`AutoApprove`.
+The charge gate runs *before* the `QUEUED` transition so a decline is a legal
+`ELIGIBLE_PROVIDERS_COMPUTED → REJECTED` (the same reorder fixed a latent illegal
+`QUEUED → REJECTED` on quota-reservation denial). `set_budget`/`get_budget_status` MCP
+tools expose it; `get_router_status().budget.action_required` flags "set_budget".
+
 ## Mapping to the phased plan (§25)
 
 | Phase | Status | Notes |
