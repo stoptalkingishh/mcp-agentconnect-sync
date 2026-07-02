@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Test / tooling
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime state (shared memory DB, artifacts). Never commit these.
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Secrets. NEVER commit real secrets — only the *.example.yaml templates.
+config/secrets.yaml
+config/secrets.local.yaml
+.env
+*.pem
+*.key
+
+# Editor
+.idea/
+.vscode/
+*.swp

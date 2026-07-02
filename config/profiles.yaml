@@ -1,0 +1,43 @@
+# Capability profiles (handoff §17).
+#
+# Agents request a *profile*, not a raw model name. The router resolves a profile
+# to a concrete (provider, model) using live residency + quota state.
+#
+# `current_resident` and `any` are sentinel model ids resolved at routing time
+# against the Local Model Manager's loaded model / available models.
+
+default_resident_model: qwen3.6-35b-a3b
+
+profiles:
+  default_worker:
+    preferred: qwen3.6-35b-a3b
+    acceptable: [ornith-1.0-35b, qwen3.6-27b]
+
+  coding_patch:
+    preferred: ornith-1.0-35b
+    acceptable: [qwen3.6-35b-a3b, qwen3.6-27b]
+
+  coding_review:
+    preferred: qwen3.6-27b
+    acceptable: [qwen3.6-35b-a3b, ornith-1.0-35b]
+
+  fast_summary:
+    preferred: small-summarizer
+    acceptable: [qwen3.6-35b-a3b, qwen3.6-27b]
+
+  resident_ok:
+    preferred: current_resident
+    acceptable: [any]
+
+# Map agent types (handoff §20) to a default profile. Most agents should end up
+# on resident_ok or a preferred-but-flexible profile; very few require an exact
+# model.
+agent_defaults:
+  repo_scout: resident_ok
+  patch_worker: coding_patch
+  patch_reviewer: coding_review
+  log_summarizer: fast_summary
+  test_worker: resident_ok
+  memory_indexer: fast_summary
+  cloud_safe_transformer: resident_ok
+  critic_worker: coding_review

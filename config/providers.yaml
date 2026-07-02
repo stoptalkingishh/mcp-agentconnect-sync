@@ -1,0 +1,64 @@
+# Provider & model registry (handoff §6).
+#
+# The Agent Router reads this file. It may know the `secret_ref` for a provider,
+# but it must NEVER dereference it directly — only the provider gateway resolves
+# secrets at call time (see config/secrets.example.yaml and §7).
+#
+# privacy classes a provider is allowed to receive (see config/routing.yaml
+# `privacy` section for the authoritative task->provider rules):
+#   local_only     — task never leaves the local machine
+#   external       — free/low-cost cloud, only after redaction
+#   external_paid  — paid cloud, only after redaction + budget check
+
+policy_version: "2026-07-02.1"
+
+providers:
+  local_r9700:
+    type: local
+    endpoint: "https://r9700-box.local:8443/v1"
+    secret_ref: "op://AI/local-r9700/api-token"
+    privacy: local_only
+    # Local providers are backed by the Local Model Manager; residency and
+    # admission are decided from its live /status, not from this file.
+    manager_endpoint: "http://r9700-box.local:8080"
+    node_id: "r9700-box-01"
+    capabilities: [coding, summarization, patch_generation, review, reasoning]
+    quota:
+      kind: local_gpu
+
+  gemini_free:
+    type: cloud
+    endpoint: "https://generativelanguage.googleapis.com"
+    secret_ref: "op://AI/gemini/api-key"
+    privacy: external
+    capabilities: [public_reasoning, public_summarization, generic_test_generation, classification]
+    quota:
+      kind: free_tier
+      reset: daily
+      max_daily_requests: 1500
+      max_daily_tokens: 1000000
+
+  groq_free:
+    type: cloud
+    endpoint: "https://api.groq.com/openai/v1"
+    secret_ref: "op://AI/groq/api-key"
+    privacy: external
+    capabilities: [fast_classification, routing, short_summaries]
+    quota:
+      kind: free_or_low_cost
+      reset: daily
+      max_daily_requests: 14400
+      max_daily_tokens: 500000
+
+  openai_paid:
+    type: cloud
+    endpoint: "https://api.openai.com/v1"
+    secret_ref: "op://AI/openai/api-key"
+    privacy: external_paid
+    capabilities: [hard_reasoning, fallback, specialist_review]
+    quota:
+      kind: paid
+      max_daily_spend_usd: 3.00
+      # $ per 1K tokens, used for spend estimation / budget enforcement.
+      price_per_1k_input_usd: 0.0025
+      price_per_1k_output_usd: 0.01

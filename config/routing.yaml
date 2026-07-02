@@ -1,0 +1,65 @@
+# Router policy: privacy gates, output policy, model switching, local defaults,
+# and the scoring weights for provider selection (handoff §9, §10, §12, §13,
+# §16, §18).
+
+# --- Privacy routing rules (§13) ---------------------------------------------
+# For each privacy class, the set of provider privacy tiers that MAY receive the
+# task. These are HARD constraints applied before scoring (§12).
+privacy:
+  classes:
+    public:         [local_only, external, external_paid]
+    low_sensitive:  [local_only, external, external_paid]   # only after redaction
+    repo_sensitive: [local_only]
+    secret_sensitive: []                                    # never sent to any LLM
+    restricted:     [local_only]                            # unless explicitly approved
+  # Classes that require the redaction pass to succeed before any external route.
+  require_redaction: [low_sensitive]
+  # Classes that must never reach an LLM at all — block or redact.
+  block_from_llm: [secret_sensitive]
+
+# --- MCP output policy: context virtualization (§9) --------------------------
+mcp_output_policy:
+  default_max_chars: 4000
+  hard_max_chars: 12000
+  never_return_full_logs: true
+  never_return_full_repo_files: true
+  never_return_full_traces: true
+  return_refs_for_large_outputs: true
+  require_explicit_chunk_read: true
+
+# --- Local model residency / switching (§16) ---------------------------------
+model_switching:
+  default_resident_model: qwen3.6-35b-a3b
+  prefer_resident_model: true
+  avoid_switch_if_current_queue_nonempty: true
+  min_batch_size_for_switch: 4
+  min_residency_seconds: 600
+  urgent_switch_allowed: true
+  specialist_review_can_wait: true
+  switch_back_to_default_when_idle: true
+
+# --- Local inference admission defaults (§18) --------------------------------
+local_inference_defaults:
+  main_model: qwen3.6-35b-a3b
+  max_active_sequences: 4
+  max_model_len: 16384
+  default_max_output_tokens: 1200
+
+# --- Provider scoring weights (§12) ------------------------------------------
+# score = sum(bonus terms) - sum(penalty terms). Hard constraints override.
+scoring:
+  weights:
+    capability_fit: 3.0
+    expected_quality: 2.0
+    latency_fit: 1.0
+    privacy_fit: 1.5
+    availability: 1.0
+    residency_bonus: 2.5
+    quota_scarcity_penalty: 2.0
+    queue_delay_penalty: 1.5
+    model_switch_penalty: 3.0
+    cost_penalty: 2.0
+    opportunity_cost: 1.5
+  # A resident-model task pays no switch penalty; a specialist that is not loaded
+  # pays the full model_switch_penalty unless the batch threshold is met.
+  quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains
