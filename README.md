@@ -174,6 +174,24 @@ Two deliberate safety properties:
   `Console`/`AutoApprove` for CLI/trusted automation. This bounds the "stochastic blast
   zone": the agent can propose work, but the user approves the spend.
 
+### Batteries-included web approval host
+
+Don't want to build a confirmation channel? Ship the reference one:
+
+```bash
+pip install "agentconnect-router[web]"
+export AGENTCONNECT_SPEND_AUTHORIZER=web         # + optional APPROVAL_HOST/PORT/TOKEN/WEBHOOK
+agentconnect-router
+```
+
+The router serves a tiny approvals page (default `http://127.0.0.1:8770/`). When a paid/
+rented charge (or a budget request) arrives, the `submit_task` call **blocks**, a line is
+logged with the approval URL (and, if `AGENTCONNECT_APPROVAL_WEBHOOK` is set, a JSON push
+is POSTed there), and the user clicks **Approve / Deny** (or enters an amount) in the
+browser or on their phone. No response within `AGENTCONNECT_APPROVAL_TIMEOUT` (default
+300s) fails closed. The endpoint binds loopback and takes an optional bearer token — put
+it behind TLS + a token before any remote exposure.
+
 ## Privacy & secrets (fail-closed)
 
 - Tasks are classified into `public / low_sensitive / repo_sensitive /

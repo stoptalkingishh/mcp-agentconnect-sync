@@ -20,6 +20,8 @@ dependencies = [
 # Router can embed an in-process manager when no MODEL_MANAGER_URL is set. The
 # Router library never hard-imports it — this is a soft, optional extra.
 embedded = ["agentconnect-model-manager==0.2.0"]
+# Reference web approve/deny host for the spend authorizer (AGENTCONNECT_SPEND_AUTHORIZER=web).
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 agentconnect-router = "agentconnect.router.mcp_server:main"

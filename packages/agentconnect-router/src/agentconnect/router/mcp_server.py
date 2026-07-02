@@ -106,6 +106,30 @@ def _spend_authorizer_from_env():
         from ..common.authorization import ConsoleSpendAuthorizer
 
         return ConsoleSpendAuthorizer()
+    if mode == "web":
+        try:
+            from ..common.approval import ApprovalQueue, WebApprovalAuthorizer
+            from .approval_web import start_web_approval
+        except ImportError as exc:
+            _log.warning(
+                "AGENTCONNECT_SPEND_AUTHORIZER=web but the 'web' extra is not installed "
+                "(%s); falling back to deny. Install agentconnect-router[web].", exc,
+            )
+            from ..common.authorization import DenyingSpendAuthorizer
+
+            return DenyingSpendAuthorizer()
+        host = os.environ.get("AGENTCONNECT_APPROVAL_HOST", "127.0.0.1")
+        port = int(os.environ.get("AGENTCONNECT_APPROVAL_PORT", "8770"))
+        base_url = os.environ.get("AGENTCONNECT_APPROVAL_URL", f"http://{host}:{port}")
+        token = os.environ.get("AGENTCONNECT_APPROVAL_TOKEN")
+        timeout = float(os.environ.get("AGENTCONNECT_APPROVAL_TIMEOUT", "300"))
+        queue = ApprovalQueue()
+        start_web_approval(queue, host=host, port=port, token=token)
+        return WebApprovalAuthorizer(
+            queue, base_url=base_url,
+            webhook_url=os.environ.get("AGENTCONNECT_APPROVAL_WEBHOOK"),
+            timeout_seconds=timeout,
+        )
     from ..common.authorization import DenyingSpendAuthorizer
 
     return DenyingSpendAuthorizer()

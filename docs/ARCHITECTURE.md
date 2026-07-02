@@ -203,6 +203,12 @@ the stochastic agent. The service calls a `SpendAuthorizer` directly: `request_b
 re-routes) and `confirm_charge` (approve *each* paid/rented charge before it happens).
 The default `DenyingSpendAuthorizer` is fail-closed (no channel wired → no spend);
 deployments wire `CallbackSpendAuthorizer` to a native UI, or use `Console`/`AutoApprove`.
+A **batteries-included web host** ships too: `common/approval.py` (`ApprovalQueue` +
+`WebApprovalAuthorizer`, stdlib-only, blocking-with-timeout) plus `router/approval_web.py`
+(a FastAPI approve/deny dashboard + `start_web_approval`, the `[web]` extra). Enable with
+`AGENTCONNECT_SPEND_AUTHORIZER=web`; the router blocks the `submit_task` call, logs an
+approval URL (+ optional webhook push), and the user clicks Approve/Deny in a browser —
+loopback + optional bearer token, fail-closed on timeout.
 The charge gate runs *before* the `QUEUED` transition so a decline is a legal
 `ELIGIBLE_PROVIDERS_COMPUTED → REJECTED` (the same reorder fixed a latent illegal
 `QUEUED → REJECTED` on quota-reservation denial). `set_budget`/`get_budget_status` MCP
