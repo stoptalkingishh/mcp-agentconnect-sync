@@ -66,6 +66,11 @@ scoring:
     # Rented GPU nodes (Goal 4): spin-up/min-window setup + hourly-cost penalties.
     rental_setup_penalty: 2.0
     rental_cost_penalty: 2.0
+    # Learned-quality prior from observed outcomes (Phase 6). Bounded [-1,1] signal
+    # * this weight; kept modest so it tilts close calls, never dominates.
+    learned_quality: 1.5
+  # Minimum observations before a provider's learned signal is used at all.
+  learned_min_samples: 5
   # A resident-model task pays no switch penalty; a specialist that is not loaded
   # pays the full model_switch_penalty unless the batch threshold is met.
   quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains

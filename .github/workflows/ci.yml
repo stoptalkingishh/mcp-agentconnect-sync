@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the three packages (editable) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/agentconnect-core \
+                      -e packages/agentconnect-router \
+                      -e packages/agentconnect-model-manager
+          pip install pytest
+
+      - name: Run tests (offline; openssl present for the mTLS suite)
+        run: pytest -q
+
+  standalone-router:
+    # The Router is the product: it must build and run WITHOUT the Model Manager.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core + router only
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/agentconnect-core -e packages/agentconnect-router
+      - name: Import + build service standalone (no manager installed)
+        run: |
+          python - <<'PY'
+          import agentconnect.router  # imports without the manager package
+          from agentconnect.router.mcp_server import _try_embedded_manager
+          assert _try_embedded_manager() is None, "router must run standalone"
+          print("router standalone OK")
+          PY

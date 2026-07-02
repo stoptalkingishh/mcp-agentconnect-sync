@@ -30,9 +30,12 @@ def show(title: str, obj: object) -> None:
 
 
 def main() -> None:
+    # Inject an in-process client for the "rented" node too, so Goal 4 runs offline.
+    rented_factory = lambda cfg, handle: InProcessLocalClient(ResidencyManager())
     svc = RouterService.create(
         memory=SharedMemory(),  # in-memory; use a path to persist
         local_client=InProcessLocalClient(ResidencyManager()),
+        rented_client_factory=rented_factory,
     )
 
     show("router status", svc.get_router_status())
@@ -72,7 +75,22 @@ def main() -> None:
     )
     show("task 3 summary (secret_sensitive → blocked)", s3.model_dump(mode="json"))
 
+    # 4) A very large private reasoning task -> rented GPU node (opt-in + trust).
+    s4 = svc.submit_task(
+        TaskSubmission(
+            task="Reason over this large private architecture doc and propose a refactor.",
+            agent_type="repo_scout",
+            constraints=TaskConstraints(
+                privacy_class="repo_sensitive", allow_external=False, allow_rented=True
+            ),
+        )
+    )
+    show("task 4 summary (repo_sensitive + allow_rented → rented node)", s4.model_dump(mode="json"))
+    show("task 4 routing decision", svc.memory.get_routing_decisions(s4.task_id)[-1])
+
     show("provider status", svc.get_provider_status())
+    # Phase 6: learned scorecards accumulated from the dispatches above.
+    show("provider scorecards (Phase 6)", svc.get_provider_scorecards())
 
 
 if __name__ == "__main__":

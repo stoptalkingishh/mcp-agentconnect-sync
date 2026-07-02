@@ -70,9 +70,25 @@ CREATE TABLE IF NOT EXISTS quota_records (
     failure_reason TEXT,
     created_at   REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evaluations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider     TEXT NOT NULL,
+    model        TEXT,
+    task_id      TEXT,
+    agent_type   TEXT,
+    status       TEXT NOT NULL,     -- completed | failed
+    latency_ms   REAL DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd     REAL DEFAULT 0,
+    confidence   REAL,              -- worker-reported, if any
+    retries      INTEGER DEFAULT 0,
+    created_at   REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_logs_task ON logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_quota_provider ON quota_records(provider);
+CREATE INDEX IF NOT EXISTS idx_eval_provider ON evaluations(provider);
 """
 
 
@@ -230,6 +246,32 @@ class SharedMemory:
             "SELECT decision FROM routing_decisions WHERE task_id=? ORDER BY created_at", (task_id,)
         ).fetchall()
         return [json.loads(r["decision"]) for r in rows]
+
+    # ----------------------------------------------------------- evaluations
+    def record_evaluation(self, record: dict[str, Any]) -> None:
+        cols = (
+            "provider", "model", "task_id", "agent_type", "status", "latency_ms",
+            "input_tokens", "output_tokens", "cost_usd", "confidence", "retries",
+        )
+        placeholders = ",".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO evaluations({','.join(cols)}, created_at) VALUES({placeholders}, ?)",
+            (*[record.get(c) for c in cols], _now()),
+        )
+        self._conn.commit()
+
+    def provider_eval_aggregate(self) -> list[dict[str, Any]]:
+        """Per-provider aggregate outcomes (feeds learned routing + scorecards)."""
+        rows = self._conn.execute(
+            "SELECT provider,"
+            " COUNT(*) AS samples,"
+            " SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS successes,"
+            " AVG(latency_ms) AS avg_latency_ms,"
+            " AVG(cost_usd) AS avg_cost_usd,"
+            " AVG(confidence) AS avg_confidence"
+            " FROM evaluations GROUP BY provider"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------ search_memory
     def search_memory(

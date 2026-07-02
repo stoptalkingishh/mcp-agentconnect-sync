@@ -168,6 +168,12 @@ def build_mcp_server(service: Optional[RouterService] = None):
         return _json(svc.get_provider_status())
 
     @mcp.tool()
+    def get_provider_scorecards() -> str:
+        """Learned per-provider scorecards (success rate, latency, cost, sample
+        count) and the current learned-quality signal folded into routing (Phase 6)."""
+        return _json(svc.get_provider_scorecards())
+
+    @mcp.tool()
     def promote_task(task_id: str) -> str:
         """Raise a task's priority to urgent."""
         return _json(svc.promote_task(task_id))

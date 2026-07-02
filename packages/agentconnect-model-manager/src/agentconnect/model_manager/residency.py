@@ -52,6 +52,9 @@ class ResidencyManager:
         self._waiting = 0
         self._loaded_model: Optional[str] = None
         self._loading = False
+        # Real admission: at most max_active_sequences run concurrently; excess
+        # generate() calls block (queue) until a slot frees (handoff §18).
+        self._slots = threading.BoundedSemaphore(max_active_sequences)
 
         # Load the default model at startup.
         self.load(LoadRequest(target_model=default_model, reason="startup_default"))
@@ -162,10 +165,17 @@ class ResidencyManager:
         # switch; the manager simply executes what it's told).
         if self._loaded_model != req.model_id:
             self.load(LoadRequest(target_model=req.model_id, reason="on_demand_for_generate"))
+        # Block for a free inference slot (real admission control, §18). Excess
+        # concurrent calls queue here rather than oversubscribing the GPU.
         with self._lock:
+            self._waiting += 1
+        self._slots.acquire()
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
             self._active_sequences += 1
         try:
             return self.backend.generate(req)
         finally:
             with self._lock:
                 self._active_sequences = max(0, self._active_sequences - 1)
+            self._slots.release()

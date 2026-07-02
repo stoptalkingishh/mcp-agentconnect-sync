@@ -12,11 +12,13 @@ manager agent receives only summaries + refs.
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..common import privacy as privacy_mod
+from ..common.evaluation import Evaluator
 from ..common.config import ProfilesConfig, RoutingConfig, load_all
 from ..common.memory import SharedMemory
 from ..common.privacy import ClassificationHints
@@ -39,7 +41,7 @@ from .local_client import LocalClient
 from .routing import RoutingContext, RoutingEngine
 
 if TYPE_CHECKING:
-    from .provisioning import NodeProvisioner
+    from .provisioning import NodePool, NodeProvisioner
 
 
 @dataclass
@@ -55,6 +57,10 @@ class RouterService:
     # Rented-node lifecycle (Goal 4). Defaults keep everything offline/testable.
     provisioner: Optional["NodeProvisioner"] = None
     rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None
+    # Evaluation & learning (Phase 6).
+    evaluator: Optional[Evaluator] = None
+    # Warm-node reuse for rented GPUs (Goal 4 amortization).
+    node_pool: Optional["NodePool"] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -74,14 +80,49 @@ class RouterService:
         gw = gateway or ProviderGateway(local_client=local_client)
         if local_client is not None:
             gw.bind_local(local_client)
-        from .provisioning import StubProvisioner
+        from .provisioning import NodePool, StubProvisioner
 
+        min_samples = int(routing_cfg.scoring.get("learned_min_samples", 5))
         return cls(
             memory=mem, registry=registry, profiles=profiles, routing_cfg=routing_cfg,
             quota=quota, engine=engine, gateway=gw, local_client=local_client,
             provisioner=provisioner or StubProvisioner(),
             rented_client_factory=rented_client_factory,
+            evaluator=Evaluator(mem, min_samples=min_samples),
+            node_pool=NodePool(),
         )
+
+    # ----------------------------------------------------------- evaluation
+    def _record_eval(self, cfg, model, task_id, agent_type, status, latency_ms,
+                     in_tok, out_tok, cost, confidence=None) -> None:
+        self.memory.record_evaluation(
+            {
+                "provider": cfg.provider_id, "model": model, "task_id": task_id,
+                "agent_type": agent_type, "status": status, "latency_ms": latency_ms,
+                "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
+                "confidence": confidence, "retries": 0,
+            }
+        )
+
+    def get_provider_scorecards(self) -> list[dict[str, Any]]:
+        """Per-provider learned scorecards + current learned-quality signal (Phase 6)."""
+        if self.evaluator is None:
+            return []
+        cards = self.evaluator.scorecards()
+        learned = self.evaluator.learned_quality()
+        out = []
+        for pid, sc in cards.items():
+            out.append(
+                {
+                    "provider": pid, "samples": sc.samples,
+                    "success_rate": round(sc.success_rate, 4),
+                    "avg_latency_ms": round(sc.avg_latency_ms, 2),
+                    "avg_cost_usd": round(sc.avg_cost_usd, 6),
+                    "avg_confidence": sc.avg_confidence,
+                    "learned_quality_signal": round(learned.get(pid, 0.0), 4),
+                }
+            )
+        return sorted(out, key=lambda r: r["provider"])
 
     # ------------------------------------------------------------- dispatch
     def _dispatch(self, cfg, gen_req: GenerateRequest) -> GatewayResult:
@@ -91,33 +132,38 @@ class RouterService:
         if not RoutingEngine._is_rented(cfg):
             return self.gateway.call(cfg, gen_req)
 
-        from .provisioning import spec_from_provider
+        from .provisioning import NodePool, spec_from_provider
 
+        pool = self.node_pool or NodePool()
         spec = spec_from_provider(cfg, model_id=gen_req.model_id)
-        handle = self.provisioner.provision(spec)
-        handle = self.provisioner.wait_ready(handle)
-        try:
-            factory = self.rented_client_factory or self._default_rented_client
-            client = factory(cfg, handle)
-            resp = client.generate(gen_req)
-            # Bill the minimum rental window (amortizes spin-up); a production
-            # reaper would keep the node warm until terminate_when_idle_seconds.
+        handle, reused = pool.acquire(cfg, self.provisioner, spec)
+        factory = self.rented_client_factory or self._default_rented_client
+        client = factory(cfg, handle)
+        resp = client.generate(gen_req)
+        # Bill the rental window only on first spin-up; reuse within the warm
+        # window is free (amortization). A production reaper trues up on teardown.
+        if not reused:
             window = cfg.rental.min_rental_seconds if cfg.rental else 0
             self.quota.record_rental_window(cfg, gen_req.task_id, seconds=window)
-            self.memory.append_log(
-                gen_req.task_id,
-                f"rented_node provisioned={handle.node_id} endpoint={handle.manager_endpoint} "
-                f"billed_window_s={window}",
-            )
-            return GatewayResult(
-                output_text=resp.output_text,
-                input_tokens=resp.input_tokens,
-                output_tokens=resp.output_tokens,
-                provider=cfg.provider_id,
-                model=resp.model_id,
-            )
-        finally:
-            self.provisioner.terminate(handle)
+        pool.release(cfg)
+        self.memory.append_log(
+            gen_req.task_id,
+            f"rented_node={handle.node_id} endpoint={handle.manager_endpoint} reused={reused}",
+        )
+        return GatewayResult(
+            output_text=resp.output_text,
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+            provider=cfg.provider_id,
+            model=resp.model_id,
+        )
+
+    def reap_idle_nodes(self, now: float) -> list[str]:
+        """Terminate rented nodes idle past their window. Call periodically."""
+        if self.node_pool is None:
+            return []
+        cfgs = {p.provider_id: p for p in self.registry.all()}
+        return self.node_pool.reap_idle(self.provisioner, cfgs, now)
 
     def _default_rented_client(self, cfg, handle) -> LocalClient:
         from .local_client import HttpLocalClient
@@ -211,6 +257,9 @@ class RouterService:
             cloud_safe=redaction.cloud_safe,
         )
         state = self._transition(task_id, state, TaskState.ELIGIBLE_PROVIDERS_COMPUTED)
+        # Refresh the learned-quality prior from observed outcomes (Phase 6).
+        if self.evaluator is not None:
+            self.engine.set_learned_quality(self.evaluator.learned_quality())
         decision = self.engine.route(ctx, status)
         self.memory.record_routing_decision(task_id, decision.model_dump(mode="json"))
         self.memory.append_log(
@@ -256,11 +305,16 @@ class RouterService:
             temperature=0.2,
             priority=submission.constraints.priority,
         )
+        started = time.perf_counter()
         try:
             result = self._dispatch(cfg, gen_req)
         except Exception as exc:  # dispatch failure -> FAILED, reconcile as failure.
+            latency_ms = (time.perf_counter() - started) * 1000.0
             if reservation is not None:
                 self.quota.reconcile(reservation, cfg, 0, 0, status="failed", failure_reason=str(exc))
+            self._record_eval(
+                cfg, gen_req.model_id, task_id, submission.agent_type, "failed", latency_ms, 0, 0, 0.0
+            )
             self.memory.append_log(task_id, f"dispatch_failed: {exc}", level="error")
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
@@ -269,9 +323,15 @@ class RouterService:
                 recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
             )
             return self._summary(task_id)
+        latency_ms = (time.perf_counter() - started) * 1000.0
 
         if reservation is not None:
             self.quota.reconcile(reservation, cfg, result.input_tokens, result.output_tokens)
+        cost = self.quota.estimate_cost_usd(cfg, result.input_tokens, result.output_tokens)
+        self._record_eval(
+            cfg, result.model, task_id, submission.agent_type, "completed",
+            latency_ms, result.input_tokens, result.output_tokens, cost,
+        )
 
         # 15. Store full result in shared memory (never returned inline).
         output_ref = self.memory.put_artifact(task_id, "output", self._clamp(result.output_text))

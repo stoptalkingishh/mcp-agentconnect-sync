@@ -142,13 +142,28 @@ This prevents the model-thrashing anti-pattern in §16.
 
 `model_manager/app.py` exposes `/status /models /queue /metrics /can_accept
 /generate /load /unload`. `ResidencyManager` (`model_manager/residency.py`) owns
-admission control: context-cap checks against `max_model_len`, active-sequence
-limits, and switch detection. The backend is pluggable (`ModelBackend`); the
-shipped `StubBackend` is deterministic so the whole system runs offline. Swap in
-vLLM/llama.cpp/Ollama/SGLang by implementing `ModelBackend`.
+admission control: context-cap checks against `max_model_len`, switch detection,
+and **real active-sequence limiting** — a `BoundedSemaphore(max_active_sequences)`
+makes `generate()` block/queue when the GPU is full rather than oversubscribe it
+(§18). The backend is pluggable (`ModelBackend`): `StubBackend` (deterministic,
+offline) and `OpenAICompatibleBackend` (real vLLM / llama.cpp / Ollama / SGLang /
+TGI, selected via `MODEL_MANAGER_BACKEND=openai` + `MODEL_BACKEND_URL`).
 
-Auth is a shared bearer token; the router resolves it from the secrets manager
-and passes it via `HttpLocalClient` — it never appears in agent-visible state.
+Authentication is **mutual TLS** — no shared bearer token (see the transport
+section above and `model_manager/tls.py`).
+
+## Evaluation & learning (§25 Phase 6)
+
+Every dispatch records an outcome (`common/memory.py` `evaluations`: provider,
+model, status, latency, tokens, cost, confidence). `common/evaluation.py`
+aggregates these into per-provider **scorecards** and a bounded `[-1, 1]`
+**learned-quality signal** (success rate primary, relative latency secondary; zero
+until `learned_min_samples` observations). The service refreshes the signal before
+each routing pass and the engine folds it in as one more scoring term
+(`learned_quality` weight in `routing.yaml`) — so observed quality tilts close
+calls without overriding hard constraints or dominating. Surfaced via the
+`get_provider_scorecards` MCP tool. This keeps learning *inside* the deterministic
+frame: outcomes adjust a prior; they never make routing stochastic.
 
 ## Shared memory & context virtualization (§8, §9)
 
@@ -175,12 +190,17 @@ enforce `max_daily_spend_usd`.
 | 2 Shared memory & virtualization | ✅ | chunked reads, summaries, state machine |
 | 3 Model residency | ✅ | inventory, load/unload, switch policy, admission |
 | 4 Cloud gateway | ✅ | registry, secrets, quota ledger, privacy gates, redaction |
-| 5 Workload-aware routing | ✅ | scarcity/opportunity/queue/switch scoring, budget enforcement |
-| 6 Evaluation & learning | ◻ scaffolded | quota/usage records exist; scoring of provider quality/latency TBD |
+| 5 Workload-aware routing | ✅ | scarcity/opportunity/queue/switch/rental scoring, budget enforcement |
+| 6 Evaluation & learning | ✅ | outcome ledger, per-provider scorecards, bounded learned-quality signal in routing |
 
-Cloud generation calls degrade to a deterministic stub when credentials/network
-are absent (`gateway._call_cloud`), so the full pipeline is exercisable offline;
-supply real keys in `config/secrets.yaml` (or env vars) to make live calls.
+Cross-cutting completions: mutual-TLS transport, the three-package split, the
+rented-GPU tier (RunPod adapter + `NodePool` warm reuse + idle reaping), a real
+OpenAI-compatible backend, real concurrency admission, and CI (3.10–3.12 +
+standalone-router job).
+
+Cloud generation and the local backend degrade to deterministic stubs when
+endpoints/credentials are absent, so the full pipeline is exercisable offline;
+supply real endpoints/keys (env or `config/secrets.yaml`) to make live calls.
 
 ## Extending
 
@@ -188,7 +208,10 @@ supply real keys in `config/secrets.yaml` (or env vars) to make live calls.
   `config/secrets.yaml`. No code change for routing.
 - **New agent type**: add capabilities in `RouterService._capabilities_for` and a
   default profile in `config/profiles.yaml` → `agent_defaults`.
-- **Real inference backend**: implement `ModelBackend` and pass it to
-  `ResidencyManager`.
+- **Real inference backend**: use `OpenAICompatibleBackend` (set
+  `MODEL_MANAGER_BACKEND=openai` + `MODEL_BACKEND_URL`) or implement `ModelBackend`.
+- **New rental vendor**: implement `NodeProvisioner` (see `RunPodProvisioner`) and
+  register it in `provisioning.provisioner_for`. The vendor control-plane key is
+  the only secret; it resolves through the secrets manager like a cloud key.
 - **Real secrets manager**: the `op://` refs are the integration point; add a
   resolver kind in `common/secrets.py` or run the `op` CLI.

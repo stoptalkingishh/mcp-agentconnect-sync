@@ -102,9 +102,11 @@ def create_app(
 def main() -> None:
     import uvicorn
 
+    from .backends import backend_from_env
+
     tls = manager_tls_from_env()
     allowed = allowed_clients_from_env()
-    app = create_app(allowed_clients=allowed)
+    app = create_app(manager=ResidencyManager(backend=backend_from_env()), allowed_clients=allowed)
     port = int(os.environ.get("MODEL_MANAGER_PORT", "8443"))
 
     if tls.mode == "mutual":

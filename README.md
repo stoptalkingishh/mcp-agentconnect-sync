@@ -166,15 +166,18 @@ meets its trust policy (ephemeral, encrypted, your image, no external logging).
 
 ## Status vs. the phased plan (§25)
 
-Implemented end-to-end (offline, tested — 43 tests): the deterministic router
-(Phases 1 & 5 core), shared memory + context virtualization (Phase 2), residency +
-admission (Phase 3), the provider gateway + secrets + quota ledger +
-privacy/redaction (Phase 4), **mutual-TLS inter-service transport**, the
-**three-package split** (Router installs without the Manager), and the
-**rented-GPU node tier** (privacy tier + budget + provisioning seam;
-`StubProvisioner` for offline runs, real vendor adapters TBD). Cloud calls degrade
-to a deterministic stub until real credentials are supplied; Phase 6
-(learning/eval) is scaffolded via the quota/usage records but not yet scored. See
+**All six phases implemented end-to-end (offline, tested — 53 tests):** the
+deterministic router (Phases 1 & 5), shared memory + context virtualization
+(Phase 2), residency + **real concurrency admission** (Phase 3), the provider
+gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
+**evaluation + learning** (Phase 6): outcomes are recorded per provider and a
+bounded learned-quality signal tilts future routing. Plus the cross-cutting work:
+**mutual-TLS inter-service transport**, the **three-package split** (Router
+installs without the Manager), the **rented-GPU node tier** with a **RunPod vendor
+adapter**, warm-node reuse + idle reaping, and a **real OpenAI-compatible inference
+backend** (vLLM / llama.cpp / Ollama). Cloud calls and the local backend degrade to
+deterministic stubs until real endpoints/credentials are supplied. CI runs the
+suite on 3.10–3.12 and verifies the Router builds standalone. See
 `docs/ARCHITECTURE.md` for the section-by-section map.
 
 ## License

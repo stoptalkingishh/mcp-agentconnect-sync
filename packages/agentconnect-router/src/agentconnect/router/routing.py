@@ -69,6 +69,12 @@ class RoutingEngine:
         self.quota = quota
         self._w = routing.scoring.get("weights", {})
         self._scarcity_threshold = routing.scoring.get("quota_scarcity_threshold_pct", 0.2)
+        # provider_id -> bounded [-1,1] learned-quality signal (Phase 6). Refreshed
+        # by the service from observed outcomes before each routing pass.
+        self._learned: dict[str, float] = {}
+
+    def set_learned_quality(self, learned: dict[str, float]) -> None:
+        self._learned = dict(learned or {})
 
     # ------------------------------------------------------------- profile
     def resolve_local_model(self, ctx: RoutingContext, status: ManagerStatus) -> ModelChoice:
@@ -278,6 +284,10 @@ class RoutingEngine:
                 PrivacyClass.public, PrivacyClass.low_sensitive, PrivacyClass.repo_sensitive, PrivacyClass.restricted
             )
             terms["opportunity_cost"] = -(0.5 if local_capable else 0.0) * w.get("opportunity_cost", 1.5)
+
+        # Learned-quality prior from observed outcomes (Phase 6). Bounded [-1,1],
+        # so it tilts close calls without overriding hard constraints or dominating.
+        terms["learned_quality"] = self._learned.get(cfg.provider_id, 0.0) * w.get("learned_quality", 1.0)
 
         total = round(sum(terms.values()), 4)
         return ScoreBreakdown(provider=cfg.provider_id, model=model_id, total=total, terms=terms)
