@@ -8,6 +8,7 @@ model-manager backends and the router's local clients alike.
 
 from .actions import Action, parse_action
 from .agent import AgentRuntime, LangGraphAgentRuntime, ModelSource, RuntimeConfig
+from .pull_worker import PullWorker
 from .results import worker_result_from_state
 from .state import RuntimeState
 from .transport import HttpAgentRuntime, RuntimeEndpoint, add_pull_routes, create_worker_app
@@ -19,6 +20,7 @@ __all__ = [
     "HttpAgentRuntime",
     "LangGraphAgentRuntime",
     "ModelSource",
+    "PullWorker",
     "RuntimeConfig",
     "RuntimeEndpoint",
     "RuntimeState",

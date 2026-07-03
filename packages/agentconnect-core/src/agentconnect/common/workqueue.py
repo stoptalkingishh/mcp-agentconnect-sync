@@ -370,6 +370,57 @@ class WorkQueue:
         self._conn.commit()
         return {"status": "claimed", "lease_expires_at": expires}
 
+    # ---------------------------------------------------------------- payload
+    def _read_artifact_full(self, artifact_id: str) -> str:
+        """Reassemble an artifact's full content from bounded chunks."""
+        parts: list[str] = []
+        offset = 0
+        while True:
+            chunk = self.memory.read_artifact_chunk(artifact_id, offset, 65536)
+            if chunk is None:
+                break
+            parts.append(chunk.content)
+            if chunk.next_offset is None:
+                break
+            offset = chunk.next_offset
+        return "".join(parts)
+
+    def payload_for(
+        self,
+        identity: str,
+        ticket_id: str,
+        lease_token: str,
+        attested_tier: Union[str, ProviderPrivacyTier, None] = None,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Return the (redacted) task body to the CURRENT lease holder.
+
+        This is the deliberate, authorized delivery seam: the internal task_id
+        and un-redacted submission never cross to a claimer, but the redacted
+        ``work_payload`` — the thing the worker must actually run — does, and
+        only to the identity holding the live lease whose attested tier still
+        admits the ticket's class. Lease-gated (mirrors ``report``/``renew``:
+        the token must match a non-expired claim held by ``identity``) and
+        authorization-gated (belt-and-suspenders re-check of ``may_claim`` so a
+        tier that was downgraded after the claim is refused). Anyone else gets a
+        typed error, never the body."""
+        now = _now() if now is None else now
+        raw = self._raw(ticket_id)
+        if raw is None:
+            return {"error": "unknown_ticket"}
+        if (
+            raw["status"] != "claimed"
+            or raw["lease_holder"] != identity
+            or raw["lease_token"] != lease_token
+            or (raw["lease_expires_at"] or 0) <= now
+        ):
+            return {"error": "lease_lost"}
+        if attested_tier is not None and not self.may_claim(attested_tier, raw["privacy_class"]):
+            return {"error": "not_authorized"}
+        ref = raw["payload_ref"]
+        payload = self._read_artifact_full(ref) if ref else ""
+        return {"ticket_id": ticket_id, "payload": payload, "payload_ref": ref}
+
     # ----------------------------------------------------------------- report
     def report(
         self,

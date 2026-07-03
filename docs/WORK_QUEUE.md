@@ -81,7 +81,7 @@ This is the identical mapping the router uses to decide which provider tiers may
    - No unsatisfied dependencies (checked in the `WHERE` clause with a `NOT EXISTS` join)
 4. For each candidate, attempt an atomic `UPDATE` that claims it. First writer wins; others continue scanning. Winner returns the ticket with:
    - `ticket_id` (opaque id, safe to hand to the worker)
-   - `payload_ref` (artifact id of the redacted payload — worker reads it separately)
+   - `payload_ref` (artifact id of the redacted payload; the HTTP pull surface resolves it to the body inline via the lease-gated `payload_for`, so a remote worker gets the runnable text in one round trip)
    - `lease_token` (fresh UUID per claim, required for report/heartbeat)
    - `lease_expires_at` (Unix timestamp)
    - `attempts` (incremented at claim, never decremented)
@@ -236,13 +236,34 @@ An additive HTTP mount (`add_pull_routes` in `runtime/transport.py`) exposes the
 
 - Identity is the peer's TLS client certificate. Because identity IS authorization on this surface (it alone gates which privacy_class a caller may claim and whether its report auto-accepts), the anchor must be unspoofable: identity is read from the ASGI-TLS extension (the terminating server's view of the cert). The client-settable `X-Client-Cert-DN` / `X-SPIFFE-ID` header is trusted **only** when the operator passes `add_pull_routes(..., trust_proxy_headers=True)`, asserting a header-stripping mTLS-terminating reverse proxy is in front. By default (`trust_proxy_headers=False`) a header-only identity is treated as no identity → `403`, so a peer connecting directly over plain HTTP cannot spoof a trusted tier.
 - Attested tier is resolved by a pluggable `tier_resolver: (identity) -> ProviderPrivacyTier | None`.
-- `GET /queue/next?capabilities=...` — claim next ticket.
+- `GET /queue/next?capabilities=...` — claim next ticket. Each claimed ticket carries its redacted task body **inline** as `payload`, so a remote worker (which has no access to the broker's artifact store) gets everything it needs to run in one round trip.
+- `GET /queue/{ticket_id}/payload?lease_token=...` — re-fetch the redacted body (e.g. after a worker restart that kept the lease).
 - `POST /queue/{ticket_id}/report` — body = `WorkerResult` + `lease_token`.
 - `POST /queue/{ticket_id}/heartbeat` — renew lease.
+
+**Authorized payload delivery.** The core `WorkQueue.payload_for(identity, ticket_id, lease_token, tier)` is the only seam that returns a task body, and it is doubly gated: the caller must hold the *live lease* (matching `lease_token`, not expired) **and** its attested tier must still `may_claim` the ticket's class (a belt-and-suspenders re-check so a post-claim tier downgrade is honored). The internal `task_id`/submission never cross — only the redacted `work_payload`, which was already made cloud-safe for that tier at enqueue.
 
 If `queue=None`, routes are not mounted — the runtime worker app is unchanged. The pull surface is **trimmable** from the core without touching behavior.
 
 Responses degrade to typed JSON (`{detail: "lease_lost"}`, `{error: "unknown_ticket"}`), never raw 500s.
+
+## Worker-Side Pull Loop (`PullWorker`)
+
+`runtime/pull_worker.py` is the client half of the federation — the program a compute contributor (a friend's box, a separate agent fleet) actually runs. The broker brokers tickets but **never executes**; the compute happens on the contributor's machine, with its own `AgentRuntime`.
+
+```python
+from agentconnect.runtime import PullWorker, LangGraphAgentRuntime
+
+worker = PullWorker(
+    LangGraphAgentRuntime(my_local_model_source),   # runs on MY box
+    base_url="https://broker.example",
+    tls=my_mutual_tls_config,                        # cert = identity = tier
+    capabilities=["coding", "summarization"],
+)
+worker.run_forever()   # claim -> run locally -> report, backing off when idle
+```
+
+Each iteration: `claim` a ticket the worker's attested tier is authorized for (body delivered inline) → `execute` it through the local runtime → `report` the `WorkerResult` back under the lease. A trusted (`local_only`) worker's completed result auto-accepts to `done`; an untrusted contributor's result lands `in_review` until a `local_only` reviewer approves it. Identity is the mTLS client certificate the worker presents; `identity_headers` is only for the header-stripping-proxy / test seam. Crash safety is the broker's: a worker that dies mid-task loses its lease and the reaper requeues the ticket — a `report` after lease expiry returns `lease_lost` (refused, never corrupting), so `heartbeat` long-running tasks to keep the lease.
 
 ## Data Model
 

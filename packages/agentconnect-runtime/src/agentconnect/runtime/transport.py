@@ -204,7 +204,21 @@ def add_pull_routes(
         identity, tier = _identity_and_tier(request)
         caps = [c for c in capabilities.split(",") if c]
         tickets = queue.claim_next(identity, tier, capabilities=caps, max=max)
+        # Deliver the redacted body inline so a remote worker (which has no access
+        # to the broker's artifact store) can actually run the task in one round
+        # trip. Lease-gated resolution: the token was just minted for this holder.
+        for t in tickets:
+            resolved = queue.payload_for(identity, t["ticket_id"], t["lease_token"], tier)
+            t["payload"] = resolved.get("payload", "") if "error" not in resolved else ""
         return {"tickets": tickets}
+
+    @app.get("/queue/{ticket_id}/payload")
+    def queue_payload(ticket_id: str, request: Request, lease_token: str = "") -> dict:
+        # Standalone re-fetch of the redacted body (e.g. after a worker restart
+        # that kept the lease). Same authorized, lease-gated seam as the inline
+        # delivery on /queue/next.
+        identity, tier = _identity_and_tier(request)
+        return queue.payload_for(identity, ticket_id, lease_token, tier)
 
     @app.post("/queue/{ticket_id}/report")
     def queue_report(ticket_id: str, body: QueueReportBody, request: Request) -> dict:
