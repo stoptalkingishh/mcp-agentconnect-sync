@@ -50,8 +50,9 @@ def build_execution_graph(
         kind, args = action.get("kind"), action.get("args", {})
         evidence = state["evidence_refs"]
         if kind == "read_file":
-            obs = read_file(workspace, args["path"])
-            evidence = evidence + [f"read_file:{args['path']}"]
+            obs = read_file(workspace, args["path"], max_chars=config.observation_max_chars)
+            if not obs.startswith("ERROR:"):
+                evidence = evidence + [f"read_file:{args['path']}"]
         elif kind == "write_file":
             obs = write_file(workspace, args["path"], args["content"])
         elif kind == "list_dir":
@@ -59,7 +60,8 @@ def build_execution_graph(
         elif kind == "shell":
             if config.allow_shell:
                 obs = run_shell(workspace, args["command"], timeout=config.shell_timeout_seconds)
-                evidence = evidence + [f"shell:{args['command'][:120]}"]
+                if not obs.startswith("ERROR:"):
+                    evidence = evidence + [f"shell:{args['command'][:120]}"]
             else:
                 obs = "ERROR: the shell action is disabled for this task."
         else:  # "invalid"
@@ -77,14 +79,26 @@ def build_execution_graph(
         action = state.get("last_action") or {}
         args = action.get("args", {})
         if action.get("kind") == "finish":
-            confidence = args.get("confidence", 0.0)
+            # The finish payload is model output: coerce every field rather than
+            # crash the run on a shape deviation (string risks, list next-action,
+            # numeric-string confidence, ...).
+            try:
+                confidence = min(max(float(args.get("confidence", 0.0)), 0.0), 1.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            raw_risks = args.get("risks") or []
+            if isinstance(raw_risks, str):
+                raw_risks = [raw_risks]
+            elif not isinstance(raw_risks, (list, tuple)):
+                raw_risks = [raw_risks]
+            next_action = args.get("recommended_next_action")
             return {
                 "done": True,
                 "status": "completed",
                 "summary": str(args.get("summary", "")),
-                "confidence": float(confidence) if isinstance(confidence, (int, float)) else 0.0,
-                "risks": state["risks"] + [str(r) for r in args.get("risks", []) if r],
-                "recommended_next_action": args.get("recommended_next_action"),
+                "confidence": confidence,
+                "risks": state["risks"] + [str(r) for r in raw_risks if r],
+                "recommended_next_action": str(next_action) if next_action is not None else None,
                 "changed_artifacts": list(workspace.changed_files),
             }
         return {

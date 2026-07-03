@@ -41,20 +41,33 @@ class Action:
     freeform: bool = False
 
 
+# Fields where an empty string is a legitimate value (e.g. creating an empty file).
+_ALLOW_EMPTY = frozenset({"content"})
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
-    """Pull the first decodable JSON object out of `text`, or None."""
+    """Pull the best JSON object out of `text`: the first one carrying a known
+    action, else the first with an ``action`` key (for a precise invalid error),
+    else the first object at all. Replies often mix prose or incidental JSON
+    (scores, quoted data) with the real action — the action must still win."""
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
     start = text.find("{")
     while start != -1:
-        decoder = json.JSONDecoder()
         try:
-            obj, _ = decoder.raw_decode(text[start:])
+            obj, end = decoder.raw_decode(text[start:])
         except json.JSONDecodeError:
             start = text.find("{", start + 1)
             continue
         if isinstance(obj, dict):
+            if obj.get("action") in KNOWN_ACTIONS:
+                return obj
+            objects.append(obj)
+        start = text.find("{", start + end)
+    for obj in objects:
+        if "action" in obj:
             return obj
-        start = text.find("{", start + 1)
-    return None
+    return objects[0] if objects else None
 
 
 def parse_action(text: str) -> Action:
@@ -65,7 +78,11 @@ def parse_action(text: str) -> Action:
     kind = obj.get("action")
     if kind not in KNOWN_ACTIONS:
         return Action("invalid", {"error": f"unknown action {kind!r}", "raw": obj})
-    missing = [k for k in _REQUIRED_ARGS[kind] if not isinstance(obj.get(k), str) or not obj[k]]
+    missing = [
+        k
+        for k in _REQUIRED_ARGS[kind]
+        if not isinstance(obj.get(k), str) or (not obj[k] and k not in _ALLOW_EMPTY)
+    ]
     if missing:
         return Action(
             "invalid",

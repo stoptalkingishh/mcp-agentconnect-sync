@@ -55,20 +55,26 @@ class LangGraphAgentRuntime:
         from .prompts import build_system_prompt
 
         workspace = Workspace.create(self.config.workspace_root or None, task_id=task_id)
-        graph = build_execution_graph(self.config, self.model_source, workspace)
-        initial: RuntimeState = {
-            "task_id": task_id,
-            "messages": [
-                {"role": "system", "content": build_system_prompt(task, self.config)},
-                {"role": "user", "content": task.task},
-            ],
-            "iteration": 0,
-            "changed_artifacts": [],
-            "evidence_refs": [],
-            "risks": [],
-        }
-        # Each step is an act node plus at most one tool node; headroom covers
-        # the finalize node and the entry edge.
-        recursion_limit = self.config.max_steps * 2 + 8
-        final = graph.invoke(initial, config={"recursion_limit": recursion_limit})
-        return worker_result_from_state(final)
+        try:
+            graph = build_execution_graph(self.config, self.model_source, workspace)
+            initial: RuntimeState = {
+                "task_id": task_id,
+                "messages": [
+                    {"role": "system", "content": build_system_prompt(task, self.config)},
+                    {"role": "user", "content": task.task},
+                ],
+                "iteration": 0,
+                "changed_artifacts": [],
+                "evidence_refs": [],
+                "risks": [],
+            }
+            # Each step is an act node plus at most one tool node; headroom covers
+            # the finalize node and the entry edge.
+            recursion_limit = self.config.max_steps * 2 + 8
+            final = graph.invoke(initial, config={"recursion_limit": recursion_limit})
+            return worker_result_from_state(final)
+        finally:
+            # Runtime-created temp workspaces are unreachable by the caller (the
+            # contract carries relative paths only), so remove them; a
+            # caller-supplied workspace_root is left untouched.
+            workspace.cleanup()
