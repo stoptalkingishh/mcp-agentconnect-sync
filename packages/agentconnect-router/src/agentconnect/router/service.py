@@ -38,6 +38,7 @@ from ..common.schemas import (
 )
 from ..common.state import TERMINAL_STATES, assert_transition
 from ..common.tokens import estimate_io_tokens
+from ..common.workqueue import WorkQueue
 from .gateway import GatewayResult, ProviderGateway
 from .local_client import LocalClient
 from .routing import RoutingContext, RoutingEngine
@@ -68,6 +69,9 @@ class RouterService:
     # Direct-to-user spend authorization (deterministic human gate). Default denies,
     # so paid/rented spend is disabled until a real user-facing authorizer is wired.
     authorizer: Optional[SpendAuthorizer] = None
+    # Federated pull work-queue (S1 core), sharing this same memory._conn. Optional
+    # only for callers that construct a bare RouterService by hand in tests.
+    workqueue: Optional[WorkQueue] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -97,6 +101,7 @@ class RouterService:
             provisioner=provisioner or StubProvisioner(),
             rented_client_factory=rented_client_factory,
             evaluator=Evaluator(mem, min_samples=min_samples),
+            workqueue=WorkQueue(mem, routing_cfg),
             node_pool=NodePool(),
             budget=BudgetManager(mem, routing_cfg),
             authorizer=authorizer or DenyingSpendAuthorizer(),
@@ -174,6 +179,88 @@ class RouterService:
             return []
         cfgs = {p.provider_id: p for p in self.registry.all()}
         return self.node_pool.reap_idle(self.provisioner, cfgs, now)
+
+    def reap_work_queue(self, now: float) -> dict[str, list[str]]:
+        """Requeue expired leases / park exhausted ones. Mirrors
+        ``reap_idle_nodes``: call periodically from an explicit loop, never a
+        background thread (keeps the offline gate deterministic)."""
+        if self.workqueue is None:
+            return {"requeued": [], "parked": []}
+        return self.workqueue.reap_expired(now)
+
+    # ------------------------------------------------- router-as-assigner tie-in
+    def enqueue_task(
+        self,
+        submission: TaskSubmission,
+        *,
+        dedup_key: Optional[str] = None,
+        required_capabilities: Optional[list[str]] = None,
+        priority: str = "normal",
+        depends_on: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Classify/redact a submission and place it on the pull work-queue,
+        THIN tie-in between the router and the federated queue.
+
+        This mirrors ``submit_task``'s classify+redact steps only — it never
+        dispatches. A routing decision is computed and recorded purely to leave
+        an ADVISORY ``assignee`` hint on the ticket (a suggested provider/tier);
+        pull workers self-select within their own authorization regardless, so a
+        wrong or absent hint never grants or denies a claim. ``submit_task`` and
+        ``queue_add`` remain independent surfaces onto the same store.
+        """
+        if self.workqueue is None:
+            raise RuntimeError("RouterService has no workqueue configured")
+
+        sub_dict = submission.model_dump(mode="json")
+        task_id = self.memory.create_task(sub_dict, agent_type=submission.agent_type)
+        self.memory.append_log(task_id, f"enqueue_task agent_type={submission.agent_type}")
+
+        hints = ClassificationHints(
+            file_paths=tuple(submission.refs), declared=submission.constraints.privacy_class
+        )
+        privacy_class = privacy_mod.classify(submission.task, hints)
+        redaction, redacted_text = privacy_mod.redact(submission.task, privacy_class)
+        payload_ref = self.memory.put_artifact(task_id, "sanitized_payload", redacted_text)
+        redaction.payload_ref = payload_ref
+        self.memory.update_task(task_id, privacy_class=privacy_class.value)
+
+        # Advisory only: a best-effort routing pass to suggest an assignee. Never
+        # blocks enqueueing — if no provider is eligible/live, the ticket is still
+        # queued with assignee=None and waits for a pull worker to self-select.
+        assignee: Optional[str] = None
+        try:
+            ctx = RoutingContext(
+                task_id=task_id,
+                privacy_class=privacy_class,
+                needed_capabilities=self._capabilities_for(submission.agent_type),
+                profile=submission.constraints.profile,
+                allow_external=submission.constraints.allow_external,
+                allow_paid=submission.constraints.allow_paid,
+                allow_rented=submission.constraints.allow_rented,
+                priority=submission.constraints.priority,
+                quality="high" if submission.constraints.quality == "high" else "standard",
+                cloud_safe=redaction.cloud_safe,
+            )
+            status = self._local_status()
+            decision = self.engine.route(ctx, status)
+            self.memory.record_routing_decision(task_id, decision.model_dump(mode="json"))
+            assignee = decision.selected_provider
+        except Exception as exc:  # advisory hint only; never fails the enqueue
+            self.memory.append_log(task_id, f"enqueue_task advisory routing failed: {exc}", level="warn")
+
+        return self.workqueue.add(
+            task=submission.task,
+            origin=f"router:{submission.agent_type or 'unknown'}",
+            privacy_class=privacy_class,
+            payload_ref=payload_ref,
+            task_id=task_id,
+            required_capabilities=required_capabilities,
+            priority=priority,
+            dedup_key=dedup_key,
+            depends_on=depends_on,
+            assignee=assignee,
+            cloud_safe=redaction.cloud_safe,
+        )
 
     def _default_rented_client(self, cfg, handle) -> LocalClient:
         from .local_client import HttpLocalClient

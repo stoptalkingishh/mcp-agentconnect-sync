@@ -234,12 +234,31 @@ tools expose it; `get_router_status().budget.action_required` flags "set_budget"
 
 Cross-cutting completions: mutual-TLS transport, the three-package split, the
 rented-GPU tier (RunPod adapter + `NodePool` warm reuse + idle reaping), a real
-OpenAI-compatible backend, real concurrency admission, and CI (3.10–3.12 +
-standalone-router job).
+OpenAI-compatible backend, real concurrency admission, **federated work queue** (pull-based
+open surface with trust × privacy boundary), and CI (3.10–3.12 + standalone-router job).
 
 Cloud generation and the local backend degrade to deterministic stubs when
 endpoints/credentials are absent, so the full pipeline is exercisable offline;
 supply real endpoints/keys (env or `config/secrets.yaml`) to make live calls.
+
+## Federated work queue (pull-based surface)
+
+Beyond push-based routing, AgentConnect exposes a **pull-based work queue** where external
+agents and untrusted compute can discover, claim, and complete work. The queue lives in
+the same SQLite store (one transactional `SharedMemory._conn`) alongside task/artifact
+state, so all state is atomic and audited.
+
+The key invariant is the **trust × privacy boundary** (`common/workqueue.py` module
+docstring + `docs/WORK_QUEUE.md`):
+
+- A worker's attested tier (not self-declared) determines which privacy classes it may claim.
+- Tickets are stored `parked` if their class admits no tier (e.g., `secret_sensitive`).
+- Results from untrusted tiers land `in_review` until a `local_only` reviewer approves.
+- Leases are fenced with per-claim tokens; the reaper requeues and regenerates them.
+- Dependencies are enforced; privacy monotonicity prevents laundering output downward.
+
+This is not a generic queue — it is a bounded surface for federation with fail-closed
+guarantees. See `docs/WORK_QUEUE.md` for the full design, MCP API, and threat model.
 
 ## Extending
 

@@ -95,6 +95,48 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_quota_provider ON quota_records(provider);
 CREATE INDEX IF NOT EXISTS idx_eval_provider ON evaluations(provider);
 CREATE INDEX IF NOT EXISTS idx_quota_created ON quota_records(created_at);
+
+-- Federated work-queue (WorkQueue lives over this same connection so queue
+-- state, task state, artifacts and audit are ONE transactional store). All
+-- authorization (which tier may see/claim which privacy_class) is recomputed
+-- live from routing config in WorkQueue; the allowed_tiers column below is a
+-- denormalized cache for UX/indexing only and is NEVER trusted for a claim.
+CREATE TABLE IF NOT EXISTS work_queue (
+    ticket_id       TEXT PRIMARY KEY,
+    dedup_key       TEXT,               -- origin idempotency key (partial-unique)
+    origin          TEXT,               -- enqueuing identity (audit)
+    task_id         TEXT,               -- FK-by-convention to tasks.task_id
+    payload_ref     TEXT,               -- artifact id of the worker-visible payload
+    privacy_class   TEXT NOT NULL,      -- authoritative for authorization
+    allowed_tiers   TEXT,               -- json cache; NOT trusted for the claim
+    required_capabilities TEXT,         -- json list; matching filter, not a gate
+    priority        TEXT DEFAULT 'normal',
+    status          TEXT NOT NULL,      -- open|claimed|in_review|done|parked|failed
+    assignee        TEXT,               -- advisory router hint; never enforced
+    lease_holder    TEXT,
+    lease_tier      TEXT,
+    lease_token     TEXT,               -- fencing token (fresh per claim)
+    lease_expires_at REAL,
+    attempts        INTEGER DEFAULT 0,
+    max_attempts    INTEGER DEFAULT 3,
+    result_ref      TEXT,               -- artifact id of the WorkerResult json
+    result_status   TEXT,               -- pending|approved|rejected
+    provenance      TEXT,               -- json audit trail
+    park_reason     TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    claimed_at      REAL,
+    completed_at    REAL
+);
+CREATE TABLE IF NOT EXISTS work_queue_deps (
+    ticket_id   TEXT NOT NULL,
+    depends_on  TEXT NOT NULL,
+    PRIMARY KEY(ticket_id, depends_on)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wq_dedup ON work_queue(dedup_key) WHERE dedup_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_wq_status_priority ON work_queue(status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_wq_lease ON work_queue(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_wqdeps_ticket ON work_queue_deps(ticket_id);
 """
 
 

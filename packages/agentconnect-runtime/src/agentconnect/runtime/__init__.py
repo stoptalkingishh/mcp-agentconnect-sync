@@ -10,7 +10,7 @@ from .actions import Action, parse_action
 from .agent import AgentRuntime, LangGraphAgentRuntime, ModelSource, RuntimeConfig
 from .results import worker_result_from_state
 from .state import RuntimeState
-from .transport import HttpAgentRuntime, RuntimeEndpoint, create_worker_app
+from .transport import HttpAgentRuntime, RuntimeEndpoint, add_pull_routes, create_worker_app
 from .workspace import Workspace, WorkspaceError
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "RuntimeState",
     "Workspace",
     "WorkspaceError",
+    "add_pull_routes",
     "create_worker_app",
     "parse_action",
     "worker_result_from_state",

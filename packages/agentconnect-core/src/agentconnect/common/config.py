@@ -225,6 +225,26 @@ def load_routing() -> RoutingConfig:
     return RoutingConfig(raw=_load_yaml("routing.yaml"))
 
 
+def load_workers() -> dict[str, str]:
+    """Optional worker_id -> attested ``ProviderPrivacyTier`` map
+    (``config/workers.yaml``, key ``workers``).
+
+    Soft-optional, unlike ``load_providers``/``load_routing``: a missing file
+    returns ``{}`` rather than raising, since a fresh checkout may not federate
+    any pull workers yet. Fail-closed downstream — an identity absent from this
+    map resolves to no attested tier, so the work-queue's admissible-class
+    computation yields nothing and every claim is denied; this map can only
+    ever grant a tier, never widen access beyond what routing.yaml's
+    ``privacy.classes`` admits for that tier.
+    """
+    path = CONFIG_DIR / "workers.yaml"
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    return {str(k): str(v) for k, v in (data.get("workers") or {}).items()}
+
+
 @lru_cache(maxsize=1)
 def load_all() -> tuple[ProviderRegistryConfig, ProfilesConfig, RoutingConfig]:
     """Cached bundle of all config. Call `load_all.cache_clear()` in tests."""

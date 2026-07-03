@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from pydantic import BaseModel
 
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
     from agentconnect.common.config import TlsClientConfig
+    from agentconnect.common.workqueue import WorkQueue
 
     from .agent import AgentRuntime
 
@@ -107,6 +108,124 @@ def create_worker_app(
         if busy:
             return CanAcceptResponse(can_accept=False, reason="worker at capacity").model_dump()
         return CanAcceptResponse(can_accept=True).model_dump()
+
+    return app
+
+
+class QueueReportBody(BaseModel):
+    """Wire body for POST /queue/{ticket_id}/report: the fencing token plus the
+    same fields as ``WorkerResult`` (defined here, not core, mirroring
+    ``RunTaskRequest`` — both ends of this wire live in this module)."""
+
+    lease_token: str
+    status: str = "completed"
+    summary: str = ""
+    confidence: float = 0.0
+    changed_artifacts: list[str] = []
+    evidence_refs: list[str] = []
+    risks: list[str] = []
+    recommended_next_action: Optional[str] = None
+
+
+class QueueHeartbeatBody(BaseModel):
+    lease_token: str
+    extend_seconds: int = 120
+
+
+def add_pull_routes(
+    app: "FastAPI",
+    queue: Optional["WorkQueue"],
+    tier_resolver: Callable[[str], Optional[str]],
+    *,
+    trust_proxy_headers: bool = False,
+) -> "FastAPI":
+    """Mount the federated pull surface on ``app``: ``GET /queue/next``,
+    ``POST /queue/{ticket_id}/report``, ``POST /queue/{ticket_id}/heartbeat``.
+
+    Additive and trimmable: if ``queue`` is None, nothing is mounted and
+    ``app`` is returned unchanged — the core worker app (``/run``,
+    ``/can_accept``) is untouched by this function's existence.
+
+    Identity, never the request body, decides the trust tier — and that tier is
+    the SOLE gate on which privacy_class a caller may claim and whether its
+    report is auto-accepted. Because identity IS authorization here, the trust
+    anchor must be real: the identity is taken from the ASGI-TLS extension (the
+    terminating server's view of the client certificate, not settable by the
+    remote peer). The client-settable ``X-Client-Cert-DN`` / ``X-SPIFFE-ID``
+    header is trusted ONLY when the operator passes ``trust_proxy_headers=True``,
+    asserting that a header-stripping, mTLS-terminating reverse proxy sits in
+    front (it overwrites, never forwards, those headers). With the default
+    ``trust_proxy_headers=False`` a header-only identity is treated as no
+    identity -> 403, so a peer connecting directly over plain HTTP cannot spoof a
+    trusted tier. No identity, or an identity ``tier_resolver`` does not
+    recognize, is a 403 before any queue call — fail-closed, same contract as
+    ``queue_next``'s ``unknown_worker_identity`` on the MCP surface. The body
+    never carries a tier (mirrors ``RunTaskRequest`` carrying only task content,
+    never a policy override).
+
+    Business-logic outcomes (``lease_lost``, ``not_authorized``, ...) are the
+    ``WorkQueue`` methods' own typed dict returns, passed through as 200 JSON —
+    never a raw 500. Only identity/authorization failures raise HTTP errors.
+    """
+    if queue is None:
+        return app
+
+    from fastapi import HTTPException, Request
+
+    # ``from __future__ import annotations`` makes every annotation below a
+    # string; FastAPI resolves it via ``typing.get_type_hints(fn)`` against
+    # the route functions' ``__globals__`` (this module's globals), not this
+    # factory's locals. Publish the lazily-imported names there so `Request`
+    # is recognized as the special inject-the-request type, not a query param.
+    globals().setdefault("Request", Request)
+    globals().setdefault("HTTPException", HTTPException)
+
+    from agentconnect.common.asgi_identity import (
+        _forwarded_header_identity,
+        _tls_extension_identity,
+    )
+
+    def _identity_and_tier(request: "Request") -> tuple[str, str]:
+        # The certificate as surfaced by the TLS-terminating server is always a
+        # trustworthy anchor. A plain proxy header is trusted only under the
+        # operator's explicit trust_proxy_headers opt-in (header-stripping proxy).
+        identity = _tls_extension_identity(request.scope)
+        if identity is None and trust_proxy_headers:
+            identity = _forwarded_header_identity(request.scope)
+        if identity is None:
+            raise HTTPException(status_code=403, detail="no_client_identity")
+        tier = tier_resolver(identity)
+        if tier is None:
+            raise HTTPException(status_code=403, detail="unknown_or_unauthorized_identity")
+        return identity, tier
+
+    @app.get("/queue/next")
+    def queue_next(request: Request, capabilities: str = "", max: int = 1) -> dict:
+        identity, tier = _identity_and_tier(request)
+        caps = [c for c in capabilities.split(",") if c]
+        tickets = queue.claim_next(identity, tier, capabilities=caps, max=max)
+        return {"tickets": tickets}
+
+    @app.post("/queue/{ticket_id}/report")
+    def queue_report(ticket_id: str, body: QueueReportBody, request: Request) -> dict:
+        identity, tier = _identity_and_tier(request)
+        result = WorkerResult(
+            status=body.status,
+            summary=body.summary,
+            confidence=body.confidence,
+            changed_artifacts=body.changed_artifacts,
+            evidence_refs=body.evidence_refs,
+            risks=body.risks,
+            recommended_next_action=body.recommended_next_action,
+        )
+        return queue.report(identity, tier, ticket_id, body.lease_token, result)
+
+    @app.post("/queue/{ticket_id}/heartbeat")
+    def queue_heartbeat(ticket_id: str, body: QueueHeartbeatBody, request: Request) -> dict:
+        identity, _tier = _identity_and_tier(request)
+        return queue.renew(
+            identity, ticket_id, body.lease_token, extend_seconds=body.extend_seconds
+        )
 
     return app
 

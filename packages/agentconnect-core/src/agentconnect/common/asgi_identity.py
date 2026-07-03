@@ -14,18 +14,38 @@ from __future__ import annotations
 from typing import Optional
 
 
-def _peer_identity(scope) -> Optional[str]:
-    """Best-effort peer identity from the ASGI-TLS extension or a proxy header."""
+def _tls_extension_identity(scope) -> Optional[str]:
+    """Peer identity from the ASGI-TLS extension ONLY — i.e. the real client
+    certificate as surfaced by the ASGI server. This is a trustworthy anchor: it
+    cannot be set by the remote client, only by the terminating TLS server."""
     ext = (scope.get("extensions") or {}).get("tls") or {}
     # ASGI-TLS extension (PEP-ish): client cert subject may be exposed here.
     subject = ext.get("client_cert_name") or ext.get("client_cert_subject")
-    if subject:
-        return str(subject)
+    return str(subject) if subject else None
+
+
+def _forwarded_header_identity(scope) -> Optional[str]:
+    """Peer identity from a reverse-proxy header (``X-Client-Cert-DN`` /
+    ``X-SPIFFE-ID``). Trustworthy ONLY if a header-stripping mTLS-terminating
+    proxy sits in front — otherwise it is client-settable and MUST NOT be trusted
+    as an authorization anchor. Callers gate this behind an explicit opt-in."""
     for name, value in scope.get("headers", []):
         lname = name.decode().lower() if isinstance(name, bytes) else str(name).lower()
         if lname in ("x-client-cert-dn", "x-spiffe-id"):
             return value.decode() if isinstance(value, bytes) else str(value)
     return None
+
+
+def _peer_identity(scope) -> Optional[str]:
+    """Best-effort peer identity from the ASGI-TLS extension or a proxy header.
+
+    NOTE: the header fallback is client-spoofable without a header-stripping
+    proxy; :class:`ClientIdentityMiddleware` uses it only as an allowlist
+    hardening on top of the CA (and defers when absent). A surface that makes
+    identity the SOLE authorization determinant must NOT accept the header
+    fallback without an explicit trusted-proxy opt-in — see
+    ``runtime.transport.add_pull_routes``."""
+    return _tls_extension_identity(scope) or _forwarded_header_identity(scope)
 
 
 class ClientIdentityMiddleware:

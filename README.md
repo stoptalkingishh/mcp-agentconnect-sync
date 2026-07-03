@@ -52,7 +52,7 @@ config/                      # policy & registry (edit these, not code)
 
 packages/
   agentconnect-core/         # shared, framework-free (pydantic + pyyaml only)
-    …/common/{schemas,state,memory,quota,privacy,providers,secrets,config,tokens}.py
+    …/common/{schemas,state,memory,quota,privacy,providers,secrets,config,tokens,workqueue}.py
   agentconnect-router/       # the PRIMARY product — Agent Router MCP control plane
     …/router/{routing,gateway,service,mcp_server,local_client,provisioning}.py
   agentconnect-model-manager/# optional satellite — local inference appliance
@@ -60,9 +60,10 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 174 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # 228 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end walkthrough, no GPU required
 docs/ARCHITECTURE.md         # detailed design notes + section map
+docs/WORK_QUEUE.md           # federated pull-based work queue design
 ```
 
 ## Quick start
@@ -72,7 +73,7 @@ pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q                      # 174 passing, fully offline
+pytest -q                      # 228 passing, fully offline
 python examples/demo.py        # end-to-end: submit tasks, see compact summaries
 ```
 
@@ -120,6 +121,11 @@ Register the router with Claude Code (`.mcp.json`):
 | Tool | Returns |
 |------|---------|
 | `submit_task(task, agent_type, profile, privacy_class, …)` | compact `TaskSummary` + artifact refs |
+| `queue_add(task, privacy_class, …)` | ticket + status |
+| `queue_next(worker_id, capabilities)` | list of claimable tickets |
+| `queue_claim(worker_id, ticket_id)` | claimed ticket or error |
+| `queue_report(worker_id, ticket_id, lease_token, result)` | ticket/result status |
+| `queue_status(ticket_id, …)` | ticket metadata + audit trail |
 | `get_task_status(task_id)` | status summary |
 | `get_task_artifacts(task_id)` | `{kind: artifact_id}` |
 | `read_artifact_chunk(artifact_id, offset, max_chars)` | bounded chunk + `next_offset` |
@@ -137,6 +143,27 @@ only status + summary + refs + risks + next action. The router's default output
 policy (`config/routing.yaml`) caps MCP payloads and forbids returning full logs,
 full repo files, or full traces inline — the manager pulls detail on demand with
 `read_artifact_chunk` / `get_log_slice`.
+
+## Federated work queue (pull-based, open surface)
+
+Beyond routing, AgentConnect offers a **pull-based work queue** where separate agents and
+untrusted external compute can discover and claim work — all while respecting the
+trust × privacy boundary. Workers pull tickets for the privacy class they are authorized
+for; results from untrusted workers land in a review gate before becoming truth.
+
+| Tier | Who | Can claim | Auto-trusted |
+|---|---|---|---|
+| `local_only` | your box | all classes | yes — auto-approve results |
+| `private_rented` | rented GPU, your model | public, low_sensitive | no — results require review |
+| `external` | free cloud API | public, low_sensitive (redacted) | no — results require review |
+| `external_paid` | paid cloud API | public, low_sensitive (redacted) | no — results require review |
+
+- **Atomicity & fencing:** One shared SQLite store; claim is a single guarded `UPDATE`. Leases expire; the reaper requeues, and fresh tokens prevent stale workers from submitting results.
+- **Result verification:** Results from untrusted tiers land `in_review` until a `local_only` reviewer approves.
+- **Dependencies:** Tickets can depend on other tickets. A child is claimable only when all parents are `done`. Privacy monotonicity is enforced: a lower-class ticket cannot depend on a higher-class parent (prevents laundering).
+- **Idempotency:** Deduplicated by key; terminal states (done, failed) are never reopened. Already-reported tickets are refused.
+
+See [docs/WORK_QUEUE.md](docs/WORK_QUEUE.md) for the full design, MCP API, and examples.
 
 ## Three-tier compute (owned · rented · cloud)
 
@@ -261,7 +288,7 @@ A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 174 tests):** the
+**All six phases implemented end-to-end (offline, tested — 228 tests):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
