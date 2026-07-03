@@ -154,13 +154,18 @@ def build_mcp_server(service: Optional[RouterService] = None):
         priority: str = "normal",
         quality: str = "standard",
         max_output_tokens: Optional[int] = None,
+        execution: str = "oneshot",
         refs: Optional[list[str]] = None,
     ) -> str:
         """Submit a task for routing. Returns a COMPACT summary + artifact refs
         (never full output). Use read_artifact_chunk / get_log_slice for detail.
 
         Set allow_rented=True to permit a repo_sensitive task to run on a trusted
-        rented GPU node (for very large private models)."""
+        rented GPU node (for very large private models).
+
+        Set execution="agentic" to run the task through the worker runtime's
+        act/tool loop (filesystem/shell/tests/browser tools in a confined
+        workspace) instead of a single generation. Agentic runs local-only."""
         constraints = TaskConstraints(
             profile=profile,
             privacy_class=privacy_class,  # type: ignore[arg-type]
@@ -170,6 +175,7 @@ def build_mcp_server(service: Optional[RouterService] = None):
             priority=priority,  # type: ignore[arg-type]
             quality=quality,
             max_output_tokens=max_output_tokens,
+            execution=execution,
         )
         submission = TaskSubmission(
             task=task, agent_type=agent_type, constraints=constraints, refs=refs or []

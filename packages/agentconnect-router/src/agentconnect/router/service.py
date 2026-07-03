@@ -300,6 +300,21 @@ class RouterService:
         cfg = self.registry.get(decision.selected_provider)
         assert cfg is not None
 
+        # Agentic execution runs the worker runtime's tool loop in-process and
+        # feeds each tool observation back to the model, so it may run only on a
+        # local resident model — never an external/rented provider. Fail closed
+        # here (a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED) before any spend.
+        if submission.constraints.execution == "agentic" and cfg.type != "local":
+            self._transition(task_id, state, TaskState.REJECTED)
+            self.memory.update_task(
+                task_id, state=TaskState.REJECTED.value,
+                summary=f"Agentic execution needs a local provider; routing selected "
+                f"{cfg.provider_id} ({cfg.type}).",
+                recommended_next_action="Resubmit as one-shot, or constrain the task so a "
+                "local model is eligible.",
+            )
+            return self._summary(task_id)
+
         # Deterministic per-charge user confirmation for real-money routes, BEFORE
         # queueing (so a decline is a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED).
         if cfg.privacy == "external_paid" or RoutingEngine._is_rented(cfg):
@@ -329,6 +344,9 @@ class RouterService:
         state = self._transition(task_id, state, TaskState.QUEUED)
         state = self._transition(task_id, state, TaskState.DISPATCHED)
         state = self._transition(task_id, state, TaskState.RUNNING)
+
+        if submission.constraints.execution == "agentic":
+            return self._run_agentic(cfg, submission, task_id, state, max_out, reservation)
 
         gen_req = GenerateRequest(
             request_id=f"req_{uuid.uuid4().hex[:10]}",
@@ -385,6 +403,95 @@ class RouterService:
             f"in={result.input_tokens} out={result.output_tokens} output_ref={output_ref}"
         )
         # 16. Return compact summary + refs. 17. Decision already logged above.
+        return self._summary(task_id)
+
+    # --------------------------------------------------------- agentic dispatch
+    def _run_agentic(
+        self, cfg, submission: TaskSubmission, task_id: str, state: TaskState,
+        max_out: int, reservation,
+    ) -> TaskSummary:
+        """Execute the task through the worker runtime's act/tool loop instead of
+        a single generation. The model is reached through the gateway (same
+        provider/secrets/mTLS as one-shot); token usage is summed across steps
+        and reconciled once. Reached only for local providers (guarded above)."""
+        # Lazy import: one-shot-only deployments need not install the runtime
+        # (and its langgraph dependency).
+        from agentconnect.runtime import LangGraphAgentRuntime, RuntimeConfig
+        from .runtime_dispatch import GatewayModelSource
+
+        model_id = submission.constraints.require_exact_model or self.profiles.default_resident_model
+        source = GatewayModelSource(self.gateway, cfg, model_id)
+        runtime = LangGraphAgentRuntime(
+            source,
+            RuntimeConfig(model_id=model_id, max_output_tokens=max_out),
+        )
+
+        started = time.perf_counter()
+        try:
+            worker = runtime.run(submission, task_id=task_id)
+        except Exception as exc:  # runtime failure -> FAILED, reconcile as failure.
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            if reservation is not None:
+                self.quota.reconcile(reservation, cfg, source.total_input_tokens,
+                                     source.total_output_tokens, status="failed",
+                                     failure_reason=str(exc))
+            self._record_eval(
+                cfg, model_id, task_id, submission.agent_type, "failed", latency_ms,
+                source.total_input_tokens, source.total_output_tokens, 0.0
+            )
+            self.memory.append_log(task_id, f"agentic_run_failed: {exc}", level="error")
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=f"Agentic run on {cfg.provider_id} failed.",
+                recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
+            )
+            return self._summary(task_id)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        in_tok, out_tok = source.total_input_tokens, source.total_output_tokens
+        if reservation is not None:
+            self.quota.reconcile(reservation, cfg, in_tok, out_tok)
+        cost = self.quota.estimate_cost_usd(cfg, in_tok, out_tok)
+        eval_status = "completed" if worker.status == "completed" else "failed"
+        self._record_eval(
+            cfg, model_id, task_id, submission.agent_type, eval_status,
+            latency_ms, in_tok, out_tok, cost, confidence=worker.confidence,
+        )
+
+        # Full structured result to shared memory; the manager sees only a summary.
+        output_ref = self.memory.put_artifact(
+            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+        )
+        self.memory.append_log(
+            task_id, f"agentic provider={cfg.provider_id} model={model_id} steps={source.calls} "
+            f"status={worker.status} confidence={worker.confidence} in={in_tok} out={out_tok} "
+            f"changed={len(worker.changed_artifacts)} output_ref={output_ref}"
+        )
+
+        if worker.status == "completed":
+            state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
+            state = self._transition(task_id, state, TaskState.CHECKS_RUN)
+            state = self._transition(task_id, state, TaskState.REVIEW_READY)
+            state = self._transition(task_id, state, TaskState.APPROVED)
+            self._transition(task_id, state, TaskState.COMPLETE)
+            self.memory.update_task(
+                task_id, state=TaskState.COMPLETE.value,
+                summary=self._first_line(worker.summary) or "Agentic task completed.",
+                recommended_next_action=worker.recommended_next_action
+                or "Read the output artifact chunk if details are needed.",
+            )
+        else:
+            # The loop stopped without a finish (e.g. step cap). Not an exception,
+            # but not a success either — surface it as FAILED with the runtime's
+            # own risks/next-action so the manager can decide.
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=self._first_line(worker.summary) or "Agentic task did not complete.",
+                recommended_next_action=worker.recommended_next_action
+                or "Raise the step limit or narrow the task, then retry.",
+            )
         return self._summary(task_id)
 
     # ------------------------------------------------------ other MCP tools

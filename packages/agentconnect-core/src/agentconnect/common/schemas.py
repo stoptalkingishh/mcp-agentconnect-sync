@@ -93,6 +93,11 @@ class TaskConstraints(BaseModel):
     allow_rented: bool = False  # opt-in to run repo_sensitive on a rented GPU node
     priority: Priority = Priority.normal
     quality: str = "standard"  # standard | high | best_effort
+    # oneshot: a single model generation (default). agentic: run the task through
+    # the worker runtime's act/tool loop. Agentic is local-only — its tool
+    # observations would otherwise be fed back to an external model (see
+    # RouterService._run_agentic).
+    execution: str = "oneshot"
 
 
 class TaskSubmission(BaseModel):

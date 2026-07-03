@@ -20,6 +20,10 @@ dependencies = [
 # Router can embed an in-process manager when no MODEL_MANAGER_URL is set. The
 # Router library never hard-imports it — this is a soft, optional extra.
 embedded = ["agentconnect-model-manager==0.2.0"]
+# Agentic execution: the worker runtime's act/tool loop, dispatched in-process
+# for tasks submitted with execution="agentic". Lazily imported — the Router
+# never hard-imports it, so one-shot-only deployments can skip it.
+agentic = ["agentconnect-runtime==0.1.0"]
 # Reference web approve/deny host for the spend authorizer (AGENTCONNECT_SPEND_AUTHORIZER=web).
 web = ["fastapi>=0.110", "uvicorn>=0.29"]
 
