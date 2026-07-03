@@ -4,13 +4,14 @@ This document maps the [handoff specification](../README.md) to the code and
 explains the boundaries that keep the system deterministic and safe. Section
 numbers (§) refer to the original handoff.
 
-## Three packages, one shared core
+## Four packages, one shared core
 
 ```
 packages/
   agentconnect-core/          ← shared core: policy-agnostic (pydantic+pyyaml)  → agentconnect.common.*
   agentconnect-router/        ← Machine A: Agent Router MCP — control plane (§4.1) → agentconnect.router.*
   agentconnect-model-manager/ ← Machine B: Local Model Manager — appliance (§4.2)  → agentconnect.model_manager.*
+  agentconnect-runtime/       ← Agent runtime — LangChain/LangGraph worker stack  → agentconnect.runtime.*
 ```
 
 They share the `agentconnect` **PEP 420 namespace** (no top-level `__init__.py`),
@@ -53,6 +54,7 @@ logic, one level up.
 | Concern | Owner | Where |
 |---|---|---|
 | What should happen (decisions) | Agent Router | `router/routing.py`, `router/service.py` |
+| How the task is executed | Agent Runtime | `runtime/agent.py`, `runtime/graph.py` |
 | Local execution (residency, generation) | Local Model Manager | `model_manager/residency.py` |
 | Credentials | Secrets Manager (via gateway) | `common/secrets.py`, `router/gateway.py` |
 | State + artifacts | Shared Memory | `common/memory.py` |
@@ -61,6 +63,8 @@ logic, one level up.
 Guardrails enforced by structure:
 - The Model Manager imports **nothing** from `router/` — it cannot become the
   policy engine.
+- The Agent Runtime should not decide global policy; it executes tasks under
+  router control.
 - Only `router/gateway.py` constructs a `SecretResolver`; secrets never reach the
   agent/MCP layer.
 

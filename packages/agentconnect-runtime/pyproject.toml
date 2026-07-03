@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentconnect-runtime"
+version = "0.1.0"
+description = "AgentConnect worker runtime skeleton (LangChain/LangGraph execution layer)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "agentconnect-core==0.2.0",
+]
+
+[project.optional-dependencies]
+lang = [
+    "langchain",
+    "langgraph",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentconnect.runtime*"]
+namespaces = true
