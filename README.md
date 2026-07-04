@@ -61,7 +61,8 @@ packages/
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
 tests/                       # 277 unit + e2e tests, run offline (stub backend + mTLS)
-examples/demo.py             # end-to-end walkthrough, no GPU required
+examples/demo.py             # end-to-end router walkthrough, no GPU required
+examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
 docs/WORK_QUEUE.md           # federated pull-based work queue design
 ```
@@ -73,8 +74,9 @@ pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q                      # 277 passing, fully offline
-python examples/demo.py        # end-to-end: submit tasks, see compact summaries
+pytest -q                      # 271 passing, fully offline
+python examples/demo.py             # end-to-end: submit tasks, see compact summaries
+python examples/federation_demo.py  # watch a friend's box drain the queue, denials and all
 ```
 
 The Router is the product and installs **without** the Model Manager:

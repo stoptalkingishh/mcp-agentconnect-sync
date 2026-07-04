@@ -4,6 +4,8 @@ A **pull-based, open work surface** where separate agents and untrusted external
 
 This is not a generic ticketing system. It is a **work-queue + lease semantics + authorization boundary** layered onto the existing SQLite store, exposed via MCP tools and an optional HTTP pull endpoint. The differentiator — the entire point — is **which participant may see and claim which work**, and **whether we trust the result they return**.
 
+> **See it run:** `python examples/federation_demo.py` walks the whole loop offline — a friend's external box claims public work (landing `in_review` until a local reviewer approves), is refused a repo_sensitive ticket, and a secret_sensitive ticket is parked, unclaimable by anyone.
+
 ## The Design
 
 ### The Pull Model vs. Push
