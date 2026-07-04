@@ -207,9 +207,16 @@ def add_pull_routes(
         # Deliver the redacted body inline so a remote worker (which has no access
         # to the broker's artifact store) can actually run the task in one round
         # trip. Lease-gated resolution: the token was just minted for this holder.
+        # If delivery fails (e.g. a lease race between claim and this call), surface
+        # the error explicitly rather than handing back an empty payload the worker
+        # cannot distinguish from a genuinely empty task — see PullWorker.run_once.
         for t in tickets:
             resolved = queue.payload_for(identity, t["ticket_id"], t["lease_token"], tier)
-            t["payload"] = resolved.get("payload", "") if "error" not in resolved else ""
+            if "error" in resolved:
+                t["payload"] = None
+                t["payload_error"] = resolved["error"]
+            else:
+                t["payload"] = resolved.get("payload", "")
         return {"tickets": tickets}
 
     @app.get("/queue/{ticket_id}/payload")

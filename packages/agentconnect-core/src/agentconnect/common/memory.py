@@ -13,8 +13,10 @@ without the service frameworks.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -158,13 +160,48 @@ class ArtifactChunk:
     next_offset: Optional[int]  # None when the artifact is fully read
 
 
+def _synchronized(method):
+    """Serialize a connection-mutating method under the store's reentrant lock.
+
+    The connection is shared across threads (``check_same_thread=False``) and a
+    SQLite transaction is a property of the *connection*, not the thread. Without
+    serialization, one thread's ``commit()``/``rollback()`` acts on another
+    thread's in-flight statements — a losing claimant's ``rollback`` can discard a
+    winning claimant's not-yet-committed ``UPDATE``. Every write path (here and in
+    :class:`WorkQueue`, which shares this same lock) therefore holds the lock
+    across its whole execute→commit/rollback span, so no two writers are ever
+    between a DML statement and its commit at once. The lock is an
+    :class:`~threading.RLock` so nested writers (e.g. ``WorkQueue.report`` calling
+    ``put_artifact``) don't self-deadlock."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SharedMemory:
     def __init__(self, db_path: str | Path = ":memory:"):
         self.db_path = str(db_path)
+        # One reentrant lock guards every commit/rollback boundary on the shared
+        # connection — see _synchronized. WorkQueue binds to THIS lock so the
+        # queue and the rest of the store serialize against each other, not just
+        # within their own layer.
+        self._lock = threading.RLock()
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Wait for a lock rather than failing instantly when a *separate*
+        # connection (another process opening the same file) holds a write lock;
+        # WAL lets readers proceed concurrently with a writer. No-ops harmlessly
+        # on an in-memory db (which cannot be shared across connections anyway).
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        if self.db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
@@ -172,6 +209,7 @@ class SharedMemory:
         self._conn.close()
 
     # ----------------------------------------------------------------- tasks
+    @_synchronized
     def create_task(self, submission: dict[str, Any], agent_type: Optional[str] = None) -> str:
         task_id = _new_id("task")
         now = _now()
@@ -183,6 +221,7 @@ class SharedMemory:
         self._conn.commit()
         return task_id
 
+    @_synchronized
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -220,6 +259,7 @@ class SharedMemory:
         return {r["kind"]: r["artifact_id"] for r in rows}
 
     # ------------------------------------------------------------- artifacts
+    @_synchronized
     def put_artifact(
         self, task_id: Optional[str], kind: str, content: str, mime: str = "text/plain"
     ) -> str:
@@ -254,6 +294,7 @@ class SharedMemory:
         )
 
     # ------------------------------------------------------------------ logs
+    @_synchronized
     def append_log(self, task_id: str, message: str, level: str = "info") -> None:
         self._conn.execute(
             "INSERT INTO logs(task_id, level, message, created_at) VALUES(?,?,?,?)",
@@ -282,6 +323,7 @@ class SharedMemory:
         return [dict(r) for r in reversed(rows)]
 
     # -------------------------------------------------------------- routing
+    @_synchronized
     def record_routing_decision(self, task_id: str, decision: dict[str, Any]) -> None:
         self._conn.execute(
             "INSERT INTO routing_decisions(task_id, decision, created_at) VALUES(?,?,?)",
@@ -296,6 +338,7 @@ class SharedMemory:
         return [json.loads(r["decision"]) for r in rows]
 
     # ----------------------------------------------------------- evaluations
+    @_synchronized
     def record_evaluation(self, record: dict[str, Any]) -> None:
         cols = (
             "provider", "model", "task_id", "agent_type", "status", "latency_ms",
@@ -354,6 +397,7 @@ class SharedMemory:
         return hits[:limit]
 
     # ------------------------------------------------------------- quota records
+    @_synchronized
     def record_quota_usage(self, record: dict[str, Any]) -> None:
         cols = (
             "provider", "task_id", "est_input", "est_output", "act_input", "act_output",
@@ -389,6 +433,7 @@ class SharedMemory:
         return float(row["cost"])
 
     # -------------------------------------------------------------- settings
+    @_synchronized
     def set_setting(self, key: str, value: dict[str, Any]) -> None:
         self._conn.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)"

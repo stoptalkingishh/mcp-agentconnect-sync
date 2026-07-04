@@ -24,18 +24,26 @@ config: ``repo_sensitive``/``restricted`` -> only ``local_only``;
 are never leasable); an un-redacted ``low_sensitive`` ticket is likewise parked.
 An unmapped/empty tier yields an empty admissible-class set -> claims nothing.
 
-Concurrency. The claim is a single guarded ``UPDATE ... WHERE status='open'``:
-SQLite serializes writers, so exactly one concurrent poller wins one ticket
-(SQLite's answer to ``SELECT ... FOR UPDATE SKIP LOCKED``). ``attempts`` is
-incremented at claim, so lease expiry never double-counts.
+Concurrency. The claim is a single guarded ``UPDATE ... WHERE status='open'``,
+so exactly one poller wins one ticket (SQLite's answer to ``SELECT ... FOR
+UPDATE SKIP LOCKED``). ``attempts`` is incremented at claim, so lease expiry
+never double-counts. Two isolation regimes both hold: ACROSS PROCESSES separate
+connections are serialized by SQLite's file lock (with ``busy_timeout``/WAL set
+in :class:`SharedMemory`); WITHIN a process every writer holds the store's
+reentrant lock (``_synchronized``) across its whole execute→commit span, because
+a shared connection has ONE transaction and an unsynchronized peer's
+commit/rollback would otherwise act on this claim's in-flight ``UPDATE``. The
+broker serves remote workers from a thread pool over one connection, so this
+in-process lock — not SQLite's file lock — is what makes that path race-free.
 
 Leasing / fencing. Each claim mints a fresh ``lease_token``; report/heartbeat
 require ``status='claimed' AND lease_holder=? AND lease_token=? AND
 lease_expires_at>now``. After a reaper requeue + re-claim the token is
 regenerated, so a resurrected slow worker's report is refused even under the
 same identity. The reaper requeues expired leases with attempts remaining and
-parks the rest; it is driven by an explicit loop, never a background thread
-(keeps the offline gate deterministic).
+parks the rest; it runs on an explicit periodic call by default (keeps the
+offline gate deterministic), with ``start_reaper`` as an opt-in daemon thread
+for a long-lived broker that needs self-healing without an external scheduler.
 
 Verification gate. A report from an untrusted tier can NEVER silently become
 truth: only ``local_only`` auto-accepts (``done``); every other tier lands
@@ -55,12 +63,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Iterable, Optional, Union
 
 from .config import RoutingConfig
-from .memory import SharedMemory, _new_id, _now
+from .memory import SharedMemory, _new_id, _now, _synchronized
 from .schemas import PrivacyClass, ProviderPrivacyTier, TaskState, WorkerResult
 
 _TRUSTED_TIER = ProviderPrivacyTier.local_only.value
@@ -91,6 +100,10 @@ class WorkQueue:
         self.routing = routing
         self.default_lease_seconds = default_lease_seconds
         self._conn = memory._conn
+        # Bind the STORE's lock (not a fresh one): claim/report/approve must
+        # serialize against the store's own writes (create_task, put_artifact)
+        # on the shared connection, not merely against each other.
+        self._lock = memory._lock
 
     # ---------------------------------------------------------- authorization
     def _classes_map(self) -> dict[str, list[str]]:
@@ -121,6 +134,7 @@ class WorkQueue:
         return tier in self.allowed_tiers(privacy_class)
 
     # ------------------------------------------------------------------- add
+    @_synchronized
     def add(
         self,
         *,
@@ -163,11 +177,19 @@ class WorkQueue:
 
         # Fail-closed on dangling dependencies: a parent that does not exist would
         # make the NOT EXISTS claim gate vacuously true (child instantly
-        # claimable). Reject up front, before any artifact/row is written.
+        # claimable). Reject up front, before any artifact/row is written. Apply
+        # the SAME privacy-monotonicity check as link(): an edge created here at
+        # enqueue must not be a laundering path that link() would refuse — the
+        # child's admissible-tier set must be a subset of every parent's, or the
+        # dependency could pull sensitive output down to a lower class.
         dep_list = list(depends_on or [])
+        child_tiers = set(self.allowed_tiers(pc))
         for dep in dep_list:
-            if self._raw(dep) is None:
+            parent = self._raw(dep)
+            if parent is None:
                 return {"error": "unknown_dependency", "depends_on": dep}
+            if not child_tiers.issubset(set(self.allowed_tiers(parent["privacy_class"]))):
+                return {"error": "privacy_downgrade", "depends_on": dep}
 
         if payload_ref is None and payload is not None:
             payload_ref = self.memory.put_artifact(task_id, "work_payload", payload)
@@ -222,6 +244,7 @@ class WorkQueue:
         return self._public_row(self._raw(ticket_id))
 
     # ---------------------------------------------------------------- claim
+    @_synchronized
     def claim_next(
         self,
         identity: str,
@@ -266,6 +289,7 @@ class WorkQueue:
             claimed.append(won)
         return claimed
 
+    @_synchronized
     def claim(
         self,
         identity: str,
@@ -347,6 +371,7 @@ class WorkQueue:
         }
 
     # -------------------------------------------------------------- heartbeat
+    @_synchronized
     def renew(
         self,
         identity: str,
@@ -422,6 +447,7 @@ class WorkQueue:
         return {"ticket_id": ticket_id, "payload": payload, "payload_ref": ref}
 
     # ----------------------------------------------------------------- report
+    @_synchronized
     def report(
         self,
         identity: str,
@@ -521,6 +547,7 @@ class WorkQueue:
         return {"ticket_status": new_status, "result_status": result_status, "result_ref": result_ref}
 
     # ---------------------------------------------------------- review gate
+    @_synchronized
     def approve(
         self,
         reviewer_id: str,
@@ -551,6 +578,7 @@ class WorkQueue:
             self._set_task_state(raw["task_id"], TaskState.COMPLETE)
         return {"ticket_status": "done", "result_status": "approved"}
 
+    @_synchronized
     def reject(
         self,
         reviewer_id: str,
@@ -596,6 +624,7 @@ class WorkQueue:
         return {"ticket_status": "failed", "result_status": "rejected"}
 
     # ---------------------------------------------------------------- link
+    @_synchronized
     def link(self, ticket_id: str, depends_on: str) -> dict[str, Any]:
         """Add a dependency edge with a privacy-monotonicity check: the child's
         admissible-tier set must be a subset of the parent's (child at least as
@@ -624,9 +653,11 @@ class WorkQueue:
         return {"ok": True}
 
     # ---------------------------------------------------------------- reaper
+    @_synchronized
     def reap_expired(self, now: Optional[float] = None) -> dict[str, list[str]]:
         """Requeue expired leases that still have attempts, park the exhausted.
-        Two statements, one commit. Driven by an explicit loop, never a thread."""
+        Two statements, one commit. Call periodically from an explicit loop, or
+        let ``start_reaper`` run it on an opt-in daemon thread."""
         now = _now() if now is None else now
         requeued = [
             r["ticket_id"]
@@ -651,6 +682,32 @@ class WorkQueue:
         ]
         self._conn.commit()
         return {"requeued": requeued, "parked": parked}
+
+    def start_reaper(
+        self, interval: float = 30.0, stop: Optional[threading.Event] = None
+    ) -> tuple[threading.Thread, threading.Event]:
+        """Opt-in background reaper: a daemon thread that calls ``reap_expired``
+        every ``interval`` seconds until ``stop`` is set. Without this (or an
+        explicit periodic call), a worker that dies mid-lease leaves its ticket
+        ``claimed`` forever — heartbeating only keeps a LIVE worker's lease fresh.
+
+        Returns ``(thread, stop_event)``; call ``stop.set()`` (then optionally
+        ``thread.join()``) to end it. The loop swallows per-tick errors so a
+        transient DB hiccup can't kill the reaper. Off by default so the offline
+        test gate stays deterministic — callers wanting self-healing turn it on
+        explicitly (e.g. the broker process hosting the pull endpoints)."""
+        stop = stop or threading.Event()
+
+        def _loop() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.reap_expired()
+                except Exception:  # noqa: BLE001 — a bad tick must not kill the reaper
+                    pass
+
+        thread = threading.Thread(target=_loop, daemon=True, name="agentconnect-wq-reaper")
+        thread.start()
+        return thread, stop
 
     # ---------------------------------------------------------------- status
     def status(

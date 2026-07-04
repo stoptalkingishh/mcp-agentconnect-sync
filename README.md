@@ -74,7 +74,7 @@ pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q                      # 271 passing, fully offline
+pytest -q                      # 276 passing, fully offline
 python examples/demo.py             # end-to-end: submit tasks, see compact summaries
 python examples/federation_demo.py  # watch a friend's box drain the queue, denials and all
 ```

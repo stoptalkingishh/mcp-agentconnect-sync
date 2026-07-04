@@ -147,6 +147,15 @@ class PullWorker:
         if not tickets:
             return None
         ticket = tickets[0]
+        # Refuse to "run" a ticket whose redacted body never arrived (delivery
+        # error, or a null payload): executing an empty task would report a bogus
+        # success. Report a failure instead so the broker requeues it (attempts
+        # remaining) or fails it terminally — never a silent empty completion.
+        if ticket.get("payload_error") or ticket.get("payload") is None:
+            reason = ticket.get("payload_error", "payload_missing")
+            result = WorkerResult(status="failed", summary=f"payload not delivered: {reason}")
+            outcome = self.report(ticket["ticket_id"], ticket["lease_token"], result)
+            return {"ticket_id": ticket["ticket_id"], "result": result, "report": outcome}
         result = self._execute_with_heartbeat(ticket)
         outcome = self.report(ticket["ticket_id"], ticket["lease_token"], result)
         return {"ticket_id": ticket["ticket_id"], "result": result, "report": outcome}
