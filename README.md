@@ -60,7 +60,7 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 277 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # 279 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end router walkthrough, no GPU required
 examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
