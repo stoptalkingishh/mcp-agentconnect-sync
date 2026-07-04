@@ -7,6 +7,7 @@ a given attested tier may claim a ticket only if its tier is in the live
 routing.yaml privacy.classes[privacy_class] set, fail-closed.
 """
 
+import sqlite3
 import threading
 
 from agentconnect.common.config import load_routing
@@ -137,6 +138,38 @@ def test_claim_next_clamps_max_to_batch_ceiling():
         wq.add(privacy_class=PrivacyClass.public, payload=f"x{i}", origin="o")
     got = wq.claim_next("w", LOCAL, max=MAX_CLAIM_BATCH + 10_000)
     assert len(got) == MAX_CLAIM_BATCH
+
+
+def test_claim_next_returns_partial_batch_on_mid_batch_operational_error(monkeypatch):
+    # Regression: claim_next loops calling _try_claim per ticket, each with
+    # its own commit. If a LATER iteration's commit hit a transient
+    # sqlite3.OperationalError (e.g. SQLITE_BUSY under cross-process write
+    # contention), the exception used to propagate out of claim_next entirely
+    # -- discarding the tickets EARLIER iterations had already committed as
+    # claimed (attempts++, lease minted). Those tickets would be stranded
+    # until the reaper requeues them, because the HTTP caller (transport's
+    # _guard) turns the exception into a bare 503 and never learns their
+    # ticket_id/lease_token.
+    wq, _ = _wq()
+    for i in range(3):
+        wq.add(privacy_class=PrivacyClass.public, payload=f"x{i}", origin="o")
+
+    real_try_claim = wq._try_claim
+    calls = {"n": 0}
+
+    def flaky_try_claim(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("simulated contention")
+        return real_try_claim(*args, **kwargs)
+
+    monkeypatch.setattr(wq, "_try_claim", flaky_try_claim)
+    got = wq.claim_next("w", LOCAL, max=3)
+    # The first, already-committed claim is returned rather than lost.
+    assert len(got) == 1
+    stats = wq.stats()
+    assert stats["by_status"]["claimed"] == 1
+    assert stats["by_status"]["open"] == 2
 
 
 # ---------------------------------------------------------------------- reaper
@@ -634,6 +667,41 @@ def test_link_rejects_claimed_or_in_review_child():
     # An open child is linkable as before.
     child3 = wq.add(privacy_class=PrivacyClass.public, payload="c3", origin="o")
     assert wq.link(child3["ticket_id"], parent["ticket_id"]) == {"ok": True}
+
+
+def test_link_atomic_guard_blocks_race_past_stale_precheck(monkeypatch):
+    # Regression: the child-status guard must be enforced in the SAME atomic
+    # statement as the edge INSERT, not only in the Python-level pre-check --
+    # otherwise a concurrent claim() landing between the pre-check read and
+    # the INSERT could attach a dependency to an already-claimed child (the
+    # exact cascade-failure data-loss scenario the guard exists to prevent).
+    # Simulate that race by feeding link() a stale "open" read for the child
+    # while the ticket is ACTUALLY claimed in the store.
+    wq, _ = _wq()
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o")
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o")
+    wq.claim("w", LOCAL, child["ticket_id"])  # really claimed in the DB
+
+    real_raw = wq._raw
+    calls = {"n": 0}
+
+    def stale_raw(ticket_id):
+        calls["n"] += 1
+        if ticket_id == child["ticket_id"] and calls["n"] == 1:
+            row = dict(real_raw(ticket_id))
+            row["status"] = "open"  # stale/racy pre-check read
+            return row
+        return real_raw(ticket_id)
+
+    monkeypatch.setattr(wq, "_raw", stale_raw)
+    # The Python pre-check sees the stale "open" and would proceed, but the
+    # atomic INSERT guard must still refuse against the true DB state.
+    assert wq.link(child["ticket_id"], parent["ticket_id"]) == {"error": "child_not_linkable"}
+    # No edge was actually attached.
+    assert wq._conn.execute(
+        "SELECT 1 FROM work_queue_deps WHERE ticket_id=? AND depends_on=?",
+        (child["ticket_id"], parent["ticket_id"]),
+    ).fetchone() is None
 
 
 def test_link_duplicate_edge_is_idempotent_ok():

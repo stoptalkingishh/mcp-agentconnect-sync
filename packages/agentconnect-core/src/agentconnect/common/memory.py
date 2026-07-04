@@ -177,7 +177,20 @@ def _synchronized(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
-            return method(self, *args, **kwargs)
+            try:
+                return method(self, *args, **kwargs)
+            except Exception:
+                # A raised commit (e.g. SQLITE_BUSY at commit time) can leave the
+                # shared connection mid-transaction with this writer's DML still
+                # pending. Roll it back before releasing the lock so the next
+                # lock holder never inherits — and durably commits — a write
+                # whose caller believes it failed.
+                try:
+                    if self._conn.in_transaction:
+                        self._conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     return wrapper
 

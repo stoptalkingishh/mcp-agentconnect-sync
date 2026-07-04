@@ -60,7 +60,7 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 299 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # 309 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end router walkthrough, no GPU required
 examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
@@ -74,7 +74,7 @@ pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q                      # 299 passing, fully offline
+pytest -q                      # 309 passing, fully offline
 python examples/demo.py             # end-to-end: submit tasks, see compact summaries
 python examples/federation_demo.py  # watch a friend's box drain the queue, denials and all
 ```
@@ -311,7 +311,7 @@ A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 299 tests):** the
+**All six phases implemented end-to-end (offline, tested — 309 tests):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and

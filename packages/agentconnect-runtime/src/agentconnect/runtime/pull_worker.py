@@ -170,12 +170,25 @@ class PullWorker:
         """Poll-claim-run-report until ``stop()`` is true or ``max_iterations``
         claim attempts are made. Sleeps ``poll_interval`` on an empty claim.
         Returns the number of tickets actually processed."""
+        import httpx
+
         processed = 0
         attempts = 0
         while max_iterations is None or attempts < max_iterations:
             if stop is not None and stop():
                 break
-            outcome = self.run_once()
+            try:
+                outcome = self.run_once()
+            except (httpx.HTTPStatusError, httpx.TransportError):
+                # A transient broker failure (e.g. 503 store_busy under write
+                # contention, or a dropped connection) is retryable by
+                # contract, not fatal: back off and keep polling rather than
+                # letting the whole worker daemon die on the first blip. Any
+                # ticket already claimed before the failure keeps its lease
+                # and self-heals via the reaper if this worker never reports.
+                attempts += 1
+                sleep(self.poll_interval)
+                continue
             attempts += 1
             if outcome is None:
                 sleep(self.poll_interval)

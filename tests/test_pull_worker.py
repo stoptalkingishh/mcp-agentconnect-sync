@@ -143,6 +143,38 @@ def test_run_forever_drains_multiple_then_stops(tmp_path):
     assert all(_status(wq, tid) == "done" for tid in ids)
 
 
+def test_run_forever_survives_transient_http_status_error(tmp_path):
+    # Regression: a transient broker failure (e.g. 503 store_busy under write
+    # contention) is retryable by contract, but run_once's raise_for_status()
+    # calls used to let the httpx.HTTPStatusError propagate straight out of
+    # run_forever, killing the whole worker daemon on the first blip instead
+    # of backing off and polling again.
+    import httpx
+
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path, poll_interval=0)
+
+    real_claim = worker.claim
+    calls = {"n": 0}
+
+    def flaky_claim(max_tickets=1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            req = httpx.Request("GET", "http://test/queue/next")
+            resp = httpx.Response(503, request=req)
+            raise httpx.HTTPStatusError("store_busy", request=req, response=resp)
+        return real_claim(max_tickets=max_tickets)
+
+    worker.claim = flaky_claim
+
+    processed = worker.run_forever(max_iterations=5, sleep=lambda _s: None)
+
+    assert calls["n"] >= 2  # the loop retried past the first failure
+    assert processed == 1
+    assert _status(wq, t) == "done"
+
+
 # ----------------------------------------------------------------- heartbeat
 def _make_slow(worker, seconds):
     """Make the worker's execute() take `seconds`, so a heartbeat can fire mid-run."""

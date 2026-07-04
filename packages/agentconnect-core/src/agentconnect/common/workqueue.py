@@ -294,10 +294,25 @@ class WorkQueue:
                 req = set(json.loads(row["required_capabilities"] or "[]"))
                 if not req.issubset(worker_caps):
                     continue
-                got = self._try_claim(
-                    row["ticket_id"], identity, attested_tier, admissible,
-                    row["provenance"], lease_seconds, now,
-                )
+                try:
+                    got = self._try_claim(
+                        row["ticket_id"], identity, attested_tier, admissible,
+                        row["provenance"], lease_seconds, now,
+                    )
+                except sqlite3.OperationalError:
+                    # Transient store contention (e.g. SQLITE_BUSY) mid-batch:
+                    # earlier iterations already committed their claims. Return
+                    # the winnings-so-far rather than letting the exception
+                    # propagate and strand those already-committed tickets
+                    # behind a caller that sees only a blanket failure and never
+                    # learns their ticket_id/lease_token (see transport.queue_next's
+                    # per-ticket payload_error seam for the same principle).
+                    try:
+                        if self._conn.in_transaction:
+                            self._conn.rollback()
+                    except Exception:
+                        pass
+                    return claimed
                 if got is not None:
                     won = got
                     break
@@ -704,6 +719,9 @@ class WorkQueue:
         # worker, silently discarding a legitimate in-flight/reported result. In
         # the normal flow a child is never claimed while an existing parent is
         # not-done, so this can only arise from a retroactive link — refuse it.
+        # This is a fast-path pre-check only (cheap, common case); the INSERT
+        # below re-checks the same condition atomically, because a concurrent
+        # broker process can claim the child between this read and the write.
         if child["status"] in ("claimed", "in_review"):
             return {"error": "child_not_linkable"}
         child_tiers = set(self.allowed_tiers(child["privacy_class"]))
@@ -724,6 +742,10 @@ class WorkQueue:
         # processes, where a separate read-then-insert could let each commit an
         # opposite-direction edge and deadlock the pair. rowcount==0 => the guard
         # tripped => a cycle would have formed.
+        # The child-status re-check is folded in the SAME way and for the SAME
+        # reason: a concurrent claim() can commit between the pre-check above
+        # and this INSERT, so the status guard must be re-verified in the one
+        # atomic statement that performs the write, not in a separate read.
         cur = self._conn.execute(
             "INSERT INTO work_queue_deps(ticket_id, depends_on)"
             " SELECT ?, ? WHERE NOT EXISTS ("
@@ -731,11 +753,18 @@ class WorkQueue:
             "     SELECT ?"
             "     UNION"
             "     SELECT d.depends_on FROM work_queue_deps d JOIN reach r ON d.ticket_id=r.id"
-            "   ) SELECT 1 FROM reach WHERE id=?)",
-            (ticket_id, depends_on, depends_on, ticket_id),
+            "   ) SELECT 1 FROM reach WHERE id=?)"
+            " AND (SELECT status FROM work_queue WHERE ticket_id=?) NOT IN ('claimed','in_review')",
+            (ticket_id, depends_on, depends_on, ticket_id, ticket_id),
         )
         self._conn.commit()
         if cur.rowcount != 1:
+            # Either guard could have tripped; re-read to report the accurate
+            # reason (best-effort message only — the INSERT above is the actual
+            # atomic authority and already refused the unsafe write either way).
+            current = self._raw(ticket_id)
+            if current is not None and current["status"] in ("claimed", "in_review"):
+                return {"error": "child_not_linkable"}
             return {"error": "dependency_cycle"}
         return {"ok": True}
 
