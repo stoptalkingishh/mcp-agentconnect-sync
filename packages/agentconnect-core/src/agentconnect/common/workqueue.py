@@ -443,7 +443,13 @@ class WorkQueue:
         if attested_tier is not None and not self.may_claim(attested_tier, raw["privacy_class"]):
             return {"error": "not_authorized"}
         ref = raw["payload_ref"]
-        payload = self._read_artifact_full(ref) if ref else ""
+        # A NULL payload_ref means no body was ever stored (add() without a
+        # payload) — distinct from an empty-string payload, which is a real
+        # artifact. Return a typed error so the worker's null-payload safety net
+        # fires instead of silently running an empty task and reporting success.
+        if not ref:
+            return {"error": "no_payload"}
+        payload = self._read_artifact_full(ref)
         return {"ticket_id": ticket_id, "payload": payload, "payload_ref": ref}
 
     # ----------------------------------------------------------------- report
@@ -535,15 +541,19 @@ class WorkQueue:
             "status": eval_status,
             "confidence": wr.confidence,
         })
-        if raw["task_id"]:
-            if not succeeded:
-                # Only a terminal failure drives the task to FAILED; a requeue
-                # leaves the task state to be resolved by the next report.
-                if new_status == "failed":
+        if not succeeded:
+            # Only a terminal failure drives the task to FAILED; a requeue
+            # leaves the task state to be resolved by the next report.
+            if new_status == "failed":
+                if raw["task_id"]:
                     self._set_task_state(raw["task_id"], TaskState.FAILED)
-            else:
-                self._set_task_state(raw["task_id"],
-                                     TaskState.COMPLETE if trusted else TaskState.REVIEW_READY)
+                # A terminally-failed parent can never become 'done', so every
+                # ticket that depends on it is permanently unclaimable — cascade
+                # the failure rather than strand the children forever.
+                self._cascade_failure(ticket_id, now)
+        elif raw["task_id"]:
+            self._set_task_state(raw["task_id"],
+                                 TaskState.COMPLETE if trusted else TaskState.REVIEW_READY)
         return {"ticket_status": new_status, "result_status": result_status, "result_ref": result_ref}
 
     # ---------------------------------------------------------- review gate
@@ -565,11 +575,19 @@ class WorkQueue:
             return {"error": "not_in_review"}
         prov = json.loads(raw["provenance"] or "[]")
         prov.append({"event": "review", "reviewer": reviewer_id, "verdict": "approved", "ts": now})
-        self._conn.execute(
+        # Fold the status guard INTO the UPDATE (as claim/report/renew do): a
+        # concurrent approve/reject in another broker process could both pass the
+        # read-check above; the guarded WHERE makes the transition compare-and-set,
+        # so exactly one operator action wins and record_evaluation never
+        # double-counts.
+        cur = self._conn.execute(
             "UPDATE work_queue SET status='done', result_status='approved', completed_at=?,"
-            " provenance=?, updated_at=? WHERE ticket_id=?",
+            " provenance=?, updated_at=? WHERE ticket_id=? AND status='in_review'",
             (now, json.dumps(prov), now, ticket_id),
         )
+        if cur.rowcount != 1:
+            self._conn.rollback()
+            return {"error": "not_in_review"}
         self._conn.commit()
         self.memory.record_evaluation({
             "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "completed",
@@ -597,30 +615,41 @@ class WorkQueue:
             return {"error": "unknown_ticket"}
         if raw["status"] != "in_review":
             return {"error": "not_in_review"}
-        self.memory.record_evaluation({
-            "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "failed",
-        })
         prov = json.loads(raw["provenance"] or "[]")
         prov.append({"event": "review", "reviewer": reviewer_id, "verdict": "rejected",
                      "reason": reason, "ts": now})
-        if raw["attempts"] < raw["max_attempts"]:
-            self._conn.execute(
+        requeue = raw["attempts"] < raw["max_attempts"]
+        # Guarded compare-and-set (AND status='in_review'): a concurrent
+        # approve/reject in another broker process cannot clobber this one — the
+        # loser sees rowcount 0 and never records a spurious evaluation.
+        if requeue:
+            cur = self._conn.execute(
                 "UPDATE work_queue SET status='open', result_status='rejected',"
                 " lease_holder=NULL, lease_tier=NULL, lease_token=NULL, lease_expires_at=NULL,"
-                " provenance=?, updated_at=? WHERE ticket_id=?",
+                " provenance=?, updated_at=? WHERE ticket_id=? AND status='in_review'",
                 (json.dumps(prov), now, ticket_id),
             )
-            self._conn.commit()
-            return {"ticket_status": "open", "result_status": "rejected"}
-        self._conn.execute(
-            "UPDATE work_queue SET status='failed', result_status='rejected',"
-            " lease_holder=NULL, lease_token=NULL, lease_expires_at=NULL,"
-            " provenance=?, updated_at=? WHERE ticket_id=?",
-            (json.dumps(prov), now, ticket_id),
-        )
+        else:
+            cur = self._conn.execute(
+                "UPDATE work_queue SET status='failed', result_status='rejected',"
+                " lease_holder=NULL, lease_token=NULL, lease_expires_at=NULL,"
+                " provenance=?, updated_at=? WHERE ticket_id=? AND status='in_review'",
+                (json.dumps(prov), now, ticket_id),
+            )
+        if cur.rowcount != 1:
+            self._conn.rollback()
+            return {"error": "not_in_review"}
         self._conn.commit()
+        self.memory.record_evaluation({
+            "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "failed",
+        })
+        if requeue:
+            return {"ticket_status": "open", "result_status": "rejected"}
         if raw["task_id"]:
             self._set_task_state(raw["task_id"], TaskState.FAILED)
+        # Terminal failure: cascade to every dependent so a rejected parent does
+        # not leave its children blocked forever (mirrors report()).
+        self._cascade_failure(ticket_id, now)
         return {"ticket_status": "failed", "result_status": "rejected"}
 
     # ---------------------------------------------------------------- link
@@ -636,20 +665,37 @@ class WorkQueue:
             return {"error": "unknown_ticket"}
         if ticket_id == depends_on:
             return {"error": "self_dependency"}
-        # Cycle guard: if the parent already (transitively) depends on the child,
-        # adding child->parent closes a loop where each ticket waits on the other
-        # forever (both permanently 'blocked'). Reject at link time.
-        if self._depends_transitively(depends_on, ticket_id):
-            return {"error": "dependency_cycle"}
         child_tiers = set(self.allowed_tiers(child["privacy_class"]))
         parent_tiers = set(self.allowed_tiers(parent["privacy_class"]))
         if not child_tiers.issubset(parent_tiers):
             return {"error": "privacy_downgrade"}
-        self._conn.execute(
-            "INSERT OR IGNORE INTO work_queue_deps(ticket_id, depends_on) VALUES(?,?)",
+        # Idempotent: an edge that already exists is a no-op success, never a cycle.
+        if self._conn.execute(
+            "SELECT 1 FROM work_queue_deps WHERE ticket_id=? AND depends_on=?",
             (ticket_id, depends_on),
+        ).fetchone() is not None:
+            return {"ok": True}
+        # Cycle guard: if the parent already (transitively) depends on the child,
+        # adding child->parent closes a loop where each ticket waits on the other
+        # forever (both permanently 'blocked'). Fold the acyclicity check INTO the
+        # INSERT (a recursive-CTE guard from depends_on back to ticket_id) so the
+        # check and the write are ONE statement — atomic even across two broker
+        # processes, where a separate read-then-insert could let each commit an
+        # opposite-direction edge and deadlock the pair. rowcount==0 => the guard
+        # tripped => a cycle would have formed.
+        cur = self._conn.execute(
+            "INSERT INTO work_queue_deps(ticket_id, depends_on)"
+            " SELECT ?, ? WHERE NOT EXISTS ("
+            "   WITH RECURSIVE reach(id) AS ("
+            "     SELECT ?"
+            "     UNION"
+            "     SELECT d.depends_on FROM work_queue_deps d JOIN reach r ON d.ticket_id=r.id"
+            "   ) SELECT 1 FROM reach WHERE id=?)",
+            (ticket_id, depends_on, depends_on, ticket_id),
         )
         self._conn.commit()
+        if cur.rowcount != 1:
+            return {"error": "dependency_cycle"}
         return {"ok": True}
 
     # ---------------------------------------------------------------- reaper
@@ -867,6 +913,45 @@ class WorkQueue:
             ).fetchall()
             stack.extend(r["depends_on"] for r in rows)
         return False
+
+    def _cascade_failure(self, failed_ticket_id: str, now: float) -> list[str]:
+        """A terminally-failed ticket can never satisfy the ``depends_on='done'``
+        claim gate, so every ticket (transitively) depending on it is
+        permanently unclaimable. Drive each dependent to terminal ``failed`` and
+        fail its linked task, so a dead parent does not silently strand its
+        children forever. Idempotent: already-terminal dependents are skipped.
+        Callers hold the store lock; commits the cascade before returning."""
+        cascaded: list[str] = []
+        seen: set[str] = set()
+        stack = [failed_ticket_id]
+        while stack:
+            parent_id = stack.pop()
+            children = self._conn.execute(
+                "SELECT ticket_id FROM work_queue_deps WHERE depends_on=?", (parent_id,)
+            ).fetchall()
+            for row in children:
+                child_id = row["ticket_id"]
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                child = self._raw(child_id)
+                if child is None or child["status"] in _TERMINAL:
+                    continue
+                prov = json.loads(child["provenance"] or "[]")
+                prov.append({"event": "cascade_fail", "cause": parent_id, "ts": now})
+                self._conn.execute(
+                    "UPDATE work_queue SET status='failed', result_status='dependency_failed',"
+                    " park_reason='dependency_failed', lease_holder=NULL, lease_tier=NULL,"
+                    " lease_token=NULL, lease_expires_at=NULL, provenance=?, updated_at=?"
+                    " WHERE ticket_id=?",
+                    (json.dumps(prov), now, child_id),
+                )
+                if child["task_id"]:
+                    self._set_task_state(child["task_id"], TaskState.FAILED)
+                cascaded.append(child_id)
+                stack.append(child_id)
+        self._conn.commit()
+        return cascaded
 
     # ------------------------------------------------------------- internals
     def _raw(self, ticket_id: str) -> Optional[dict[str, Any]]:

@@ -364,9 +364,9 @@ Eleven MCP tools expose the queue (in `router/mcp_server.py`):
 
 ### Adding Work
 
-**`queue_add(task, origin=None, privacy_class=None, payload=None, payload_ref=None, task_id=None, required_capabilities=None, priority="normal", dedup_key=None, depends_on=None, max_attempts=3, assignee=None, cloud_safe=True) -> {ticket_id, status, privacy_class, allowed_tiers, park_reason}`**
+**`queue_add(task, agent_type=None, privacy_class=None, required_capabilities=None, priority="normal", dedup_key=None, depends_on=None, refs=None) -> {ticket_id, status, privacy_class, allowed_tiers, park_reason}`**
 
-Enqueue a ticket. The router ties in via `enqueue_task(submission)` to classify/redact and compute `allowed_tiers`; standalone `queue_add` is also supported. Returns compact summary; never inline payload.
+Enqueue a ticket. The MCP tool classifies + redacts `task` itself (like `submit_task`) and computes `allowed_tiers`; `refs` are file-path hints for classification, and `agent_type` records the enqueuing origin. A claimer only ever receives the redacted payload, never the raw text. Returns a compact summary; never inline payload. (The underlying core `WorkQueue.add(...)` accepts a wider set of parameters — `origin`, `payload`, `payload_ref`, `task_id`, `max_attempts`, `assignee`, `cloud_safe` — but those are not exposed on the MCP tool.)
 
 ### Claiming & Holding
 

@@ -37,6 +37,12 @@ if TYPE_CHECKING:
     from .agent import AgentRuntime
 
 
+# Server-side ceiling on a single /queue/next claim batch: back-pressure so one
+# greedy/misconfigured worker cannot drain the whole open backlog (starving
+# same-tier peers) or inflate an unbounded response in one round trip.
+MAX_CLAIM_BATCH = 50
+
+
 @dataclass(frozen=True)
 class RuntimeEndpoint:
     kind: str  # local | http
@@ -245,7 +251,12 @@ def add_pull_routes(
     @app.get("/queue/next")
     def queue_next(request: Request, capabilities: str = "", max: int = 1) -> dict:
         identity, tier = _identity_and_tier(request)
-        caps = [c for c in capabilities.split(",") if c]
+        # Strip whitespace so the common "a, b" wire convention matches a ticket's
+        # required_capabilities (which are stored un-padded).
+        caps = [c.strip() for c in capabilities.split(",") if c.strip()]
+        # Clamp server-side: one authorized worker must not drain the whole open
+        # backlog (starving same-tier peers) or inflate a single response.
+        max = max if max <= MAX_CLAIM_BATCH else MAX_CLAIM_BATCH
         tickets = _guard(queue.claim_next, identity, tier, capabilities=caps, max=max)
         # Deliver the redacted body inline so a remote worker (which has no access
         # to the broker's artifact store) can actually run the task in one round

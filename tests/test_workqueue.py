@@ -345,6 +345,118 @@ def test_pending_review_lists_only_in_review_tickets():
     assert pending[0]["status"] == "in_review"
 
 
+def test_terminally_failed_parent_cascades_failure_to_children():
+    # A parent driven to terminal 'failed' can never satisfy the depends_on='done'
+    # claim gate, so its children would be blocked forever. The failure must
+    # cascade down the whole dependency subtree instead of stranding them.
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    grandchild = wq.add(privacy_class=PrivacyClass.public, payload="g", origin="o",
+                        depends_on=[child["ticket_id"]])
+    # Report a non-'completed' status with attempts exhausted -> parent terminal.
+    c = wq.claim("w", LOCAL, parent["ticket_id"])
+    out = wq.report("w", LOCAL, parent["ticket_id"], c["lease_token"], {"status": "failed"})
+    assert out["ticket_status"] == "failed"
+    assert wq.get(parent["ticket_id"])["status"] == "failed"
+    # The entire subtree is terminally failed, not stuck open/blocked.
+    assert wq.get(child["ticket_id"])["status"] == "failed"
+    assert wq.get(child["ticket_id"])["result_status"] == "dependency_failed"
+    assert wq.get(grandchild["ticket_id"])["status"] == "failed"
+    # No longer claimable (was previously blocked forever).
+    assert wq.claim("w", LOCAL, child["ticket_id"]) == {"error": "not_claimable"}
+
+
+def test_cascade_failure_drives_linked_child_task_to_failed():
+    wq, mem = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    child_task = mem.create_task({"task": "child work"})
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   task_id=child_task, depends_on=[parent["ticket_id"]])
+    c = wq.claim("w", LOCAL, parent["ticket_id"])
+    wq.report("w", LOCAL, parent["ticket_id"], c["lease_token"], {"status": "failed"})
+    assert wq.get(child["ticket_id"])["status"] == "failed"
+    assert mem.get_task(child_task)["state"] == "FAILED"
+
+
+def test_rejected_terminal_parent_cascades_failure_to_children():
+    # The other terminal-failure seam: a reviewer rejecting an attempts-exhausted
+    # parent must also cascade to dependents.
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    c = wq.claim("w", EXTERNAL, parent["ticket_id"])  # untrusted -> in_review
+    wq.report("w", EXTERNAL, parent["ticket_id"], c["lease_token"], {"status": "completed"})
+    out = wq.reject("rev", LOCAL, parent["ticket_id"], reason="bad")
+    assert out["ticket_status"] == "failed"
+    assert wq.get(child["ticket_id"])["status"] == "failed"
+
+
+def test_payload_for_null_payload_ref_is_typed_error_not_empty_success():
+    # A ticket added without a payload has a NULL payload_ref. payload_for must
+    # return a typed error (never payload="") so the worker's null-payload safety
+    # net fires instead of running an empty task and reporting a bogus success.
+    wq, _ = _wq()
+    t = wq.add(task="x", privacy_class=PrivacyClass.public, origin="o")  # no payload
+    assert wq.get(t["ticket_id"])["payload_ref"] is None
+    c = wq.claim("w", LOCAL, t["ticket_id"])
+    res = wq.payload_for("w", t["ticket_id"], c["lease_token"], LOCAL)
+    assert res == {"error": "no_payload"}
+    # An empty-STRING payload is a real artifact and still delivers "".
+    t2 = wq.add(task="y", privacy_class=PrivacyClass.public, payload="", origin="o")
+    c2 = wq.claim("w", LOCAL, t2["ticket_id"])
+    res2 = wq.payload_for("w", t2["ticket_id"], c2["lease_token"], LOCAL)
+    assert res2.get("payload") == "" and "error" not in res2
+
+
+def test_payload_for_refuses_downgraded_tier_and_lost_lease():
+    # Crown-jewel delivery seam: the redacted body reaches ONLY the current lease
+    # holder whose attested tier still admits the class.
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.repo_sensitive, payload="secret body", origin="o")
+    c = wq.claim("w", LOCAL, t["ticket_id"], now=1000.0)
+    # Happy path: holder + valid tier gets the body.
+    ok = wq.payload_for("w", t["ticket_id"], c["lease_token"], LOCAL, now=1001.0)
+    assert ok["payload"] == "secret body"
+    # Tier downgraded after claim -> re-check refuses (belt-and-suspenders).
+    assert wq.payload_for("w", t["ticket_id"], c["lease_token"], EXTERNAL, now=1001.0) == {
+        "error": "not_authorized"
+    }
+    # Wrong identity, stale token, expired lease all -> lease_lost.
+    assert wq.payload_for("intruder", t["ticket_id"], c["lease_token"], LOCAL, now=1001.0) == {
+        "error": "lease_lost"
+    }
+    assert wq.payload_for("w", t["ticket_id"], "stale-token", LOCAL, now=1001.0) == {
+        "error": "lease_lost"
+    }
+    assert wq.payload_for("w", t["ticket_id"], c["lease_token"], LOCAL, now=1e12) == {
+        "error": "lease_lost"
+    }
+
+
+def test_approve_is_compare_and_set_second_action_refused():
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")
+    c = wq.claim("w", EXTERNAL, t["ticket_id"])
+    wq.report("w", EXTERNAL, t["ticket_id"], c["lease_token"], {"status": "completed"})
+    assert wq.approve("rev", LOCAL, t["ticket_id"])["ticket_status"] == "done"
+    # A second operator action cannot flip a done ticket back (guarded WHERE).
+    assert wq.approve("rev", LOCAL, t["ticket_id"]) == {"error": "not_in_review"}
+    assert wq.reject("rev", LOCAL, t["ticket_id"]) == {"error": "not_in_review"}
+    assert wq.get(t["ticket_id"])["status"] == "done"
+
+
+def test_link_duplicate_edge_is_idempotent_ok():
+    wq, _ = _wq()
+    a = wq.add(privacy_class=PrivacyClass.public, payload="a", origin="o")
+    b = wq.add(privacy_class=PrivacyClass.public, payload="b", origin="o")
+    assert wq.link(a["ticket_id"], b["ticket_id"]) == {"ok": True}
+    # Re-linking the same edge is a no-op success, not a spurious cycle error.
+    assert wq.link(a["ticket_id"], b["ticket_id"]) == {"ok": True}
+
+
 def test_stats_counts_by_status_and_privacy_class():
     wq, _ = _wq()
     wq.add(privacy_class=PrivacyClass.public, payload="a", origin="o")

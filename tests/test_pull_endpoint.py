@@ -206,6 +206,74 @@ def test_report_with_stale_lease_token_is_refused(tmp_path):
     assert report.json() == {"error": "lease_lost"}
 
 
+# --------------------------------------------------- standalone payload seam
+def test_standalone_payload_route_is_identity_and_lease_gated(tmp_path):
+    # GET /queue/{id}/payload re-delivers the redacted body to the CURRENT lease
+    # holder only — a wrong token or a different identity gets lease_lost.
+    wq, _ = _wq()
+    wq.add(privacy_class=PrivacyClass.public, payload="redacted body", origin="o")
+    client = TestClient(_app(tmp_path, queue=wq))
+
+    got = client.get("/queue/next", headers=_dn(client, "trusted-worker")).json()["tickets"]
+    ticket_id, lease_token = got[0]["ticket_id"], got[0]["lease_token"]
+
+    ok = client.get(
+        f"/queue/{ticket_id}/payload",
+        headers=_dn(client, "trusted-worker"),
+        params={"lease_token": lease_token},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["payload"] == "redacted body"
+
+    # Wrong token -> lease_lost.
+    bad = client.get(
+        f"/queue/{ticket_id}/payload",
+        headers=_dn(client, "trusted-worker"),
+        params={"lease_token": "not-the-token"},
+    )
+    assert bad.json() == {"error": "lease_lost"}
+
+    # A different authorized identity is not the holder -> lease_lost.
+    other = client.get(
+        f"/queue/{ticket_id}/payload",
+        headers=_dn(client, "friend-box"),
+        params={"lease_token": lease_token},
+    )
+    assert other.json() == {"error": "lease_lost"}
+
+
+def test_capabilities_query_param_tolerates_whitespace(tmp_path):
+    # The common "a, b" wire convention must still match a ticket's un-padded
+    # required_capabilities: tokens are stripped server-side.
+    wq, _ = _wq()
+    ticket = wq.add(privacy_class=PrivacyClass.public, payload="hi", origin="o",
+                    required_capabilities=["write"])
+    client = TestClient(_app(tmp_path, queue=wq))
+    resp = client.get(
+        "/queue/next",
+        headers=_dn(client, "trusted-worker"),
+        params={"capabilities": "read, write"},  # space after comma
+    )
+    assert resp.status_code == 200
+    ids = {t["ticket_id"] for t in resp.json()["tickets"]}
+    assert ticket["ticket_id"] in ids
+
+
+def test_queue_next_max_is_clamped_server_side(tmp_path):
+    # One worker must not drain the whole backlog in a single request.
+    from agentconnect.runtime.transport import MAX_CLAIM_BATCH
+
+    wq, _ = _wq()
+    for _ in range(MAX_CLAIM_BATCH + 5):
+        wq.add(privacy_class=PrivacyClass.public, payload="hi", origin="o")
+    client = TestClient(_app(tmp_path, queue=wq))
+    resp = client.get(
+        "/queue/next", headers=_dn(client, "trusted-worker"), params={"max": 100000}
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["tickets"]) == MAX_CLAIM_BATCH
+
+
 # ------------------------------------------------ transient store back-pressure
 def test_operational_error_degrades_to_503_not_500(tmp_path):
     """A store write lock held past busy_timeout by another process surfaces as a
