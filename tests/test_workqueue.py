@@ -312,3 +312,45 @@ def test_link_rejects_privacy_downgrade():
     child2 = wq.add(privacy_class=PrivacyClass.repo_sensitive, payload="c2", origin="o")
     pub_parent = wq.add(privacy_class=PrivacyClass.public, payload="pp", origin="o")
     assert wq.link(child2["ticket_id"], pub_parent["ticket_id"]) == {"ok": True}
+
+
+# ------------------------------------------------------- operator view (S3)
+def test_list_tickets_is_payload_free_and_filterable():
+    wq, _ = _wq()
+    secret_text = "the raw task body that must never leak to an operator"
+    t1 = wq.add(privacy_class=PrivacyClass.public, payload=secret_text, origin="o")
+    t2 = wq.add(privacy_class=PrivacyClass.repo_sensitive, payload="other", origin="o")
+
+    all_rows = wq.list_tickets()
+    assert {r["ticket_id"] for r in all_rows} == {t1["ticket_id"], t2["ticket_id"]}
+    blob = str(all_rows)
+    assert secret_text not in blob
+    assert all("task_id" not in r for r in all_rows)
+
+    only_repo = wq.list_tickets(privacy_class="repo_sensitive")
+    assert {r["ticket_id"] for r in only_repo} == {t2["ticket_id"]}
+
+    only_open = wq.list_tickets(status="open")
+    assert {r["ticket_id"] for r in only_open} == {t1["ticket_id"], t2["ticket_id"]}
+
+
+def test_pending_review_lists_only_in_review_tickets():
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="hi", origin="o")
+    assert wq.pending_review() == []
+    claim = wq.claim(EXTERNAL, EXTERNAL, t["ticket_id"])
+    wq.report(EXTERNAL, EXTERNAL, t["ticket_id"], claim["lease_token"], {"status": "completed"})
+    pending = wq.pending_review()
+    assert len(pending) == 1 and pending[0]["ticket_id"] == t["ticket_id"]
+    assert pending[0]["status"] == "in_review"
+
+
+def test_stats_counts_by_status_and_privacy_class():
+    wq, _ = _wq()
+    wq.add(privacy_class=PrivacyClass.public, payload="a", origin="o")
+    wq.add(privacy_class=PrivacyClass.repo_sensitive, payload="b", origin="o")
+    stats = wq.stats()
+    assert stats["by_status"]["open"] == 2
+    assert stats["by_privacy_class"]["public"] == 1
+    assert stats["by_privacy_class"]["repo_sensitive"] == 1
+    assert "capability_requirements" in stats

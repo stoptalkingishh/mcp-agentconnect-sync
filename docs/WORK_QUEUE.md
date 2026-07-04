@@ -178,9 +178,187 @@ The partial-unique index (NULLs are distinct) ensures:
 - Not claimable (the `NOT EXISTS` gate in the claim's `WHERE` clause prevents it).
 - Becomes claimable when all parents reach `done`.
 
+## Rented/Private-Tier Agentic Carve-Out (SECURITY-CRITICAL)
+
+### Agentic Execution Permission Model
+
+Agentic execution (the act/tool loop where each step's tool observations feed back to the model) has a **strict permission model** because tool observations are sensitive context. They must never reach untrusted external models.
+
+By default, **agentic runs only on owned-local resident models** — your hardware, your weights. Extending agentic to the **rented private tier** (a trusted, ephemeral, encrypted node running your weights with no external logging) is permitted when:
+
+1. **The provider is local-owned OR a trusted rented private node:**
+   - Owned-local: `cfg.type == "local"` and not a rented node.
+   - Rented private: `RoutingEngine._is_rented(cfg)` returns true AND `cfg.trust` satisfies the `repo_sensitive` trust policy (§16): ephemeral spin-up, encrypted storage, your image, no external logging.
+
+2. **The task explicitly opts in:** `submission.constraints.allow_rented == True`.
+
+3. **Cloud is always rejected:** `external` and `external_paid` tiers are never permitted for agentic, regardless of classification or opt-in. Tool observations never leave to an untrusted external provider.
+
+4. **Secret-sensitive never routes:** `secret_sensitive` is blocked before routing (§13) so never reaches the agentic guard.
+
+### The Carve-Out Guard (service.py ~line 390)
+
+The router's `submit_task` gate (before any spend) rejects agentic when permission is denied:
+
+```python
+if submission.constraints.execution == "agentic":
+    is_owned_local = cfg.type == "local" and not RoutingEngine._is_rented(cfg)
+    rented_ok = (
+        RoutingEngine._is_rented(cfg)
+        and submission.constraints.allow_rented
+        and RoutingEngine._rented_trust_ok(cfg)
+    )
+    if not (is_owned_local or rented_ok):
+        # REJECTED — before _confirm_charge, so no billing occurs
+        task_state = TaskState.REJECTED
+```
+
+The rejection explains which condition failed (cloud selected; un-opted rented node; untrusted rented node) for operator visibility.
+
+### Dispatching the Loop Through Rented (Acquire Once, Bill Once)
+
+When routing selects a rented node for agentic, the loop must dispatch every step **through the rented provider's local client**, not through the gateway. This ensures the rental is billed **exactly once** at spin-up and reused across all steps:
+
+1. **Acquire once (outside the loop):** The rented node is provisioned via `NodePool.acquire(cfg)`, billed for the min rental window, and pinned in memory.
+2. **Generate through the rented client (per step):** Each agentic loop iteration calls `client.generate(step_request)` directly against the rented node — not `gateway.call`, which mishandles rented.
+3. **Bill once:** Rental cost is recorded **once** on `acquire`, when `not reused`. Reuse of a warm node is free. Token usage is summed across all steps for the evaluation record only — the single window bill is the only money charged.
+4. **Release (in finally):** The node is released for the reaper when the loop completes or fails, allowing the idle reaper to terminate and save cost.
+
+**Rationale for the carve-out:** A rented private node runs your weights ephemerally with no external logging — that is exactly the rented tier's purpose. Tool observations staying within such a node is acceptable because they never reach an untrusted third party.
+
+---
+
+## Capability Matching (Filter, Not Authorization)
+
+Capabilities are a **ticket-to-worker matching filter only**, never a security boundary (tiers × privacy is the security boundary). A worker declaring insufficient capabilities simply is not offered a ticket; a worker over-declaring just isn't offered work it would fail at.
+
+### Capability Requirements
+
+`queue_add` accepts an optional `required_capabilities` list — a JSON array of capability names (e.g. `["patch_generation", "coding"]`) that a worker must declare to claim the ticket. The router's `enqueue_task(..., required_capabilities=None)` populates defaults from the task's `agent_type` (if not explicitly set by the caller):
+
+```python
+# RouterService.enqueue_task — required_capabilities is the method's own kwarg.
+caps = (
+    list(required_capabilities)
+    if required_capabilities is not None
+    else list(self._capabilities_for(submission.agent_type))
+)
+queue.add(..., required_capabilities=caps)
+```
+
+(An explicit caller list still wins — the test is `is not None`, so an
+explicitly passed empty list `[]` is respected as a wildcard and is NOT
+overridden by the `agent_type` default.)
+
+### Claim Filtering (WorkQueue.claim_next ~line 253)
+
+When a worker claims with `queue_next(worker_id, capabilities)`, the scan includes a subset filter:
+
+```sql
+WHERE …
+  AND required_capabilities ⊆ worker_capabilities  -- JSON containment check
+  AND …
+```
+
+A ticket with `required_capabilities=["coding"]` can only be claimed by a worker declaring `capabilities=["coding", …]`. An empty `required_capabilities` is a wildcard — claimable by any worker.
+
+### Observability: Open Capability Requirements
+
+`WorkQueue.open_capability_requirements()` returns distinct capability sets among open (unclaimed/unblocked) tickets with their counts:
+
+```python
+[
+  {"required_capabilities": ["coding", "patch_generation"], "open_tickets": 3},
+  {"required_capabilities": ["review"], "open_tickets": 1},
+  {"required_capabilities": [], "open_tickets": 5},
+]
+```
+
+This lets an operator spot "no capable worker can ever claim this" situations. The capability set is exposed in `list_tickets` and `stats` (see Operator View below).
+
+---
+
+## Operator View (Broker-Side, Read-Only)
+
+The verification gate leaves untrusted results `in_review` awaiting a `local_only` reviewer. The operator (a human or a machine) needs visibility into queue state without seeing sensitive payloads — hence a **payload-free projection** that shows metadata, provenance, and (new in this phase) capability requirements.
+
+### WorkQueue Methods (Payload-Free)
+
+Three new `WorkQueue` methods expose operator-facing views:
+
+**`list_tickets(status=None, privacy_class=None, limit=100) -> list[dict]`**  
+Filtered ticket listing. Returns rows with metadata only: `ticket_id`, `status` (with derived `blocked` state), `privacy_class`, `allowed_tiers`, `required_capabilities`, `priority`, `attempts`, `max_attempts`, `result_status`, `assignee`, `park_reason`, `origin`, `payload_ref` (artifact id; content not included), `result_ref` (artifact id), `provenance` (audit trail), `created_at`, `updated_at`. **Never includes `task_id` (an internal handle) or any payload/result content.**
+
+**`pending_review(limit=100) -> list[dict]`**  
+Shorthand for `list_tickets(status="in_review")`. Returns the backlog of tickets awaiting a `local_only` reviewer's approval.
+
+**`stats() -> dict`**  
+Aggregate counts: `{"by_status": {"open": 3, "claimed": 1, "in_review": 2, "done": 10, …}, "by_privacy_class": {"public": 8, "repo_sensitive": 5, …}, "capability_requirements": [...]}`  (the result of `open_capability_requirements()`). Lets the operator spot workload composition at a glance.
+
+### MCP Operator Tools (Read-Only, No Identity)
+
+Three new read-only MCP tools (in `router/mcp_server.py`) mirror the `WorkQueue` methods. They require **no worker identity** (they leak no payloads) but honor token auth if configured:
+
+**`queue_list(status=None, privacy_class=None, limit=100) -> str`** (JSON)  
+Calls `WorkQueue.list_tickets(...)`.
+
+**`queue_pending(limit=100) -> str`** (JSON)  
+Calls `WorkQueue.pending_review(...)`.
+
+**`queue_stats() -> str`** (JSON)  
+Calls `WorkQueue.stats()`.
+
+The existing `queue_approve(reviewer_id, ticket_id)` and `queue_reject(reviewer_id, ticket_id, reason)` remain the *actions* — they still require a `local_only` reviewer identity and re-check it independently (not delegated to the read tools).
+
+### Queue Operator Web Host (Optional, Token-Guarded)
+
+A reference read-only web host (`agentconnect.router.queue_web`, fastAPI-based, mirrors `approval_web.py`'s pattern) renders the backlog and provides approve/reject buttons:
+
+**Module:** `router/queue_web.py`
+
+**Creating the app:**
+```python
+from agentconnect.router.queue_web import create_queue_operator_app
+
+app = create_queue_operator_app(
+    wq=my_workqueue,
+    reviewer_id="ops-alice",           # identity used for approve/reject
+    reviewer_tier="local_only",        # tier re-checked by approve/reject
+    token="optional-bearer-token",     # guards /api/* (no token = public /)
+)
+```
+
+**Running a standalone server:**
+```python
+from agentconnect.router.queue_web import start_queue_operator
+
+start_queue_operator(
+    wq=my_workqueue,
+    reviewer_id="ops-alice",
+    reviewer_tier="local_only",
+    host="127.0.0.1",     # bind loopback by default (change for tunneling)
+    port=8771,
+    token="s3cret-token", # guards /api/*, optional
+)
+# Runs in a daemon thread; access http://127.0.0.1:8771/
+```
+
+**Features:**
+- `GET /` — HTML page listing open and in-review tickets (metadata + provenance; no payload content).
+- `GET /api/list`, `/api/pending`, `/api/stats` — JSON endpoints (same data).
+- `POST /api/tickets/{tid}/approve` — calls `WorkQueue.approve(reviewer_id, reviewer_tier, tid)`.
+- `POST /api/tickets/{tid}/reject` — calls `WorkQueue.reject(reviewer_id, reviewer_tier, tid, reason)`.
+- Token auth: all `/api/*` endpoints require `Authorization: Bearer <token>` if token is set. `/` (the page) is public on loopback; set `token=` to enable token auth on the page as well.
+
+**Security:** the app controls no authorization itself — it is a *surface*. Approve/reject calls independently re-check the reviewer's tier via `WorkQueue.approve`/`.reject` (which consult the live `RoutingConfig`). Token auth protects the surface; tier re-check is the gate.
+
+**Installation & Extra:** included in the existing `agentconnect-router[web]` extra (which includes `fastapi>=0.110`, `uvicorn>=0.29`). It is **never mounted by default** — an operator starts it explicitly via `start_queue_operator(...)` or manually creates and serves the app.
+
+---
+
 ## MCP Tools
 
-Eight MCP tools expose the queue (in `router/mcp_server.py`):
+Eleven MCP tools expose the queue (in `router/mcp_server.py`):
 
 ### Adding Work
 
@@ -229,6 +407,21 @@ Reject an in-review result (reviewer must be `local_only`). Requeues if attempts
 **`queue_status(ticket_id=None, status=None, limit=50) -> [{ticket summary}]`**
 
 Query ticket state. Never returns payload content — only metadata, refs, and derived state (`blocked`). Shows full audit trail via `provenance` JSON (enqueue, claim, report, review events with timestamps and identities).
+
+### Operator View (Read-Only, No Identity)
+
+**`queue_list(status=None, privacy_class=None, limit=100) -> [{ticket metadata}]`**
+
+List tickets (open, claimed, in_review, done, parked, failed) with optional filters. Returns payload-free rows: ticket_id, status, privacy_class, allowed_tiers, required_capabilities, priority, attempts, result_status, assignee, park_reason, origin, payload_ref (id only), result_ref (id only), provenance, created_at, updated_at. **Never includes task_id or payload content.** Operator tool — no worker identity required (it is read-only and leaks no payloads).
+
+**`queue_pending(limit=100) -> [{in_review tickets}]`**
+
+Shorthand for `queue_list(status="in_review")`. Returns the backlog of tickets awaiting a `local_only` reviewer's approval. Same payload-free projection.
+
+**`queue_stats() -> {by_status, by_privacy_class, capability_requirements}`**
+
+Aggregate queue state: counts by status and privacy_class, plus the distinct capability sets among open tickets. Lets an operator spot workload composition and unmatchable capability requirements.
+Operator tool — no worker identity required.
 
 ## HTTP Pull Endpoint (Optional)
 

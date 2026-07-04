@@ -212,3 +212,130 @@ def test_queue_status_never_leaks_payload_content():
     blob = json.dumps(rows)
     assert secret_text not in blob
     assert any(r["ticket_id"] == t["ticket_id"] for r in rows)
+
+
+# ------------------------------------------------------------- capabilities
+def test_enqueue_task_defaults_required_capabilities_from_agent_type():
+    mcp, svc = _server()
+    ticket = _call(mcp, "enqueue_task", task="fix the failing test", agent_type="patch_worker")
+    row = svc.workqueue.get(ticket["ticket_id"])
+    assert set(json.loads(row["required_capabilities"])) == {"patch_generation", "coding"}
+
+
+def test_enqueue_task_explicit_capabilities_override_agent_type_default():
+    mcp, svc = _server()
+    ticket = _call(
+        mcp, "enqueue_task", task="do something", agent_type="patch_worker",
+        required_capabilities=["review"],
+    )
+    row = svc.workqueue.get(ticket["ticket_id"])
+    assert json.loads(row["required_capabilities"]) == ["review"]
+
+
+def test_enqueue_task_empty_capabilities_override_is_wildcard():
+    # An explicitly passed empty list must OVERRIDE the agent_type default (the
+    # test is `is not None`, not truthiness): patch_worker would default to
+    # {"patch_generation","coding"}, but [] means wildcard -- claimable by any
+    # worker regardless of declared capabilities.
+    mcp, svc = _server()
+    ticket = _call(
+        mcp, "enqueue_task", task="fix the failing test", agent_type="patch_worker",
+        required_capabilities=[],
+    )
+    row = svc.workqueue.get(ticket["ticket_id"])
+    assert json.loads(row["required_capabilities"]) == []
+    # A worker declaring NO capabilities can still claim the wildcard ticket.
+    got = _call(mcp, "queue_next", worker_id="trusted-worker", capabilities=[], max=5)
+    assert any(t["ticket_id"] == ticket["ticket_id"] for t in got["tickets"])
+
+
+def test_worker_missing_required_capability_does_not_claim():
+    mcp, svc = _server()
+    ticket = _call(mcp, "enqueue_task", task="fix the failing test", agent_type="patch_worker")
+    # trusted-worker is local_only (authorized on public) but declares only
+    # "coding", missing "patch_generation" -- the filter, not the tier, blocks it.
+    got = _call(mcp, "queue_next", worker_id="trusted-worker", capabilities=["coding"], max=5)
+    ids = {t["ticket_id"] for t in got["tickets"]}
+    assert ticket["ticket_id"] not in ids
+
+
+def test_worker_with_required_capability_claims():
+    mcp, svc = _server()
+    ticket = _call(mcp, "enqueue_task", task="fix the failing test", agent_type="patch_worker")
+    got = _call(
+        mcp, "queue_next", worker_id="trusted-worker",
+        capabilities=["coding", "patch_generation"], max=5,
+    )
+    ids = {t["ticket_id"] for t in got["tickets"]}
+    assert ticket["ticket_id"] in ids
+
+
+def test_open_capability_requirements_reports_distinct_sets():
+    mcp, svc = _server()
+    _call(mcp, "enqueue_task", task="fix the failing test", agent_type="patch_worker")
+    _call(mcp, "enqueue_task", task="summarize the log", agent_type="log_summarizer")
+    reqs = svc.workqueue.open_capability_requirements()
+    caps_sets = {frozenset(r["required_capabilities"]) for r in reqs}
+    assert frozenset({"patch_generation", "coding"}) in caps_sets
+    assert frozenset({"summarization"}) in caps_sets
+    counts = {frozenset(r["required_capabilities"]): r["open_tickets"] for r in reqs}
+    assert counts[frozenset({"patch_generation", "coding"})] == 1
+    assert counts[frozenset({"summarization"})] == 1
+
+
+def test_open_capability_requirements_groups_by_set_not_list_order():
+    # Two tickets that require the SAME capability set but serialized their list
+    # in a different order must collapse into ONE requirement group -- otherwise
+    # the "no worker can ever claim this" signal fragments and undercounts.
+    from agentconnect.common.schemas import PrivacyClass
+
+    _, svc = _server()
+    svc.workqueue.add(
+        task="a", privacy_class=PrivacyClass.public,
+        required_capabilities=["coding", "patch_generation"],
+    )
+    svc.workqueue.add(
+        task="b", privacy_class=PrivacyClass.public,
+        required_capabilities=["patch_generation", "coding"],
+    )
+    reqs = svc.workqueue.open_capability_requirements()
+    matching = [r for r in reqs if frozenset(r["required_capabilities"]) == frozenset({"coding", "patch_generation"})]
+    assert len(matching) == 1
+    assert matching[0]["open_tickets"] == 2
+    # The reported set is normalized (sorted), not the raw insertion order.
+    assert matching[0]["required_capabilities"] == ["coding", "patch_generation"]
+
+
+# --------------------------------------------------------- operator MCP tools
+def test_queue_list_is_payload_free():
+    mcp, _ = _server()
+    secret_text = "raw operator-visible secret task body"
+    t = _call(mcp, "queue_add", task=secret_text, privacy_class="public")
+    rows = _call(mcp, "queue_list")
+    blob = json.dumps(rows)
+    assert secret_text not in blob
+    assert any(r["ticket_id"] == t["ticket_id"] for r in rows)
+    assert all("task_id" not in r for r in rows)
+
+
+def test_queue_pending_and_queue_approve_compose():
+    mcp, _ = _server()
+    t = _call(mcp, "queue_add", task="hi", privacy_class="public")
+    claim = _call(mcp, "queue_claim", worker_id="friend-box", ticket_id=t["ticket_id"])
+    _call(mcp, "queue_report", worker_id="friend-box", ticket_id=t["ticket_id"], lease_token=claim["lease_token"])
+    pending = _call(mcp, "queue_pending")
+    assert any(r["ticket_id"] == t["ticket_id"] for r in pending)
+    approved = _call(mcp, "queue_approve", reviewer_id="manager", ticket_id=t["ticket_id"])
+    assert approved["ticket_status"] == "done"
+    pending_after = _call(mcp, "queue_pending")
+    assert not any(r["ticket_id"] == t["ticket_id"] for r in pending_after)
+
+
+def test_queue_stats_reports_counts():
+    mcp, _ = _server()
+    _call(mcp, "queue_add", task="hi", privacy_class="public")
+    _call(mcp, "queue_add", task="internal", privacy_class="repo_sensitive")
+    stats = _call(mcp, "queue_stats")
+    assert stats["by_status"]["open"] == 2
+    assert stats["by_privacy_class"]["public"] == 1
+    assert stats["by_privacy_class"]["repo_sensitive"] == 1

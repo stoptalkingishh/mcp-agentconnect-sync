@@ -60,7 +60,7 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 228 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # 277 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end walkthrough, no GPU required
 docs/ARCHITECTURE.md         # detailed design notes + section map
 docs/WORK_QUEUE.md           # federated pull-based work queue design
@@ -73,7 +73,7 @@ pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q                      # 228 passing, fully offline
+pytest -q                      # 277 passing, fully offline
 python examples/demo.py        # end-to-end: submit tasks, see compact summaries
 ```
 
@@ -126,6 +126,9 @@ Register the router with Claude Code (`.mcp.json`):
 | `queue_claim(worker_id, ticket_id)` | claimed ticket or error |
 | `queue_report(worker_id, ticket_id, lease_token, result)` | ticket/result status |
 | `queue_status(ticket_id, …)` | ticket metadata + audit trail |
+| `queue_list(status, privacy_class, …)` | payload-free ticket listing (operator view) |
+| `queue_pending(limit)` | in_review backlog (operator view) |
+| `queue_stats()` | queue counts + capability requirements (operator view) |
 | `get_task_status(task_id)` | status summary |
 | `get_task_artifacts(task_id)` | `{kind: artifact_id}` |
 | `read_artifact_chunk(artifact_id, offset, max_chars)` | bounded chunk + `next_offset` |
@@ -182,6 +185,24 @@ rental vendor's control-plane API key is the only secret and lives in the secret
 manager, used solely to rent/terminate the box. A `repo_sensitive` task may run on
 a rented node only with explicit opt-in (`allow_rented`) **and** when the node
 meets its trust policy (ephemeral, encrypted, your image, no external logging).
+
+### Agentic execution on the rented tier
+
+`execution="agentic"` runs the worker runtime's act/tool loop in-process, feeding
+each tool observation back to the model. Those observations must never reach an
+**untrusted external** model, so agentic runs only on (a) an owned-local resident
+model, or (b) a **trusted, opted-in rented private node** — a box running your
+weights ephemerally with no external logging (exactly the rented tier's purpose).
+Cloud (`external`/`external_paid`) agentic is always rejected; `secret_sensitive`
+never routes at all. The guard fails closed even if routing selected rented for a
+public task without `allow_rented` or without a trust-satisfying node.
+
+On the rented tier the loop dispatches every step through the rented path, not the
+gateway: the node is **acquired once** before the loop, **reused across all steps**,
+its rental window **billed exactly once** at spin-up, and it is **released** (for
+the idle reaper) in a `finally`. Token usage is summed across steps for the
+evaluation record only — the single window bill is the whole money path (a rented
+node is `type="local"`, so no cloud quota is reserved or reconciled).
 
 ## Spend budget & direct user authorization (fail-closed on money)
 
@@ -288,7 +309,7 @@ A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 228 tests):** the
+**All six phases implemented end-to-end (offline, tested — 277 tests):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
@@ -297,10 +318,13 @@ bounded learned-quality signal tilts future routing. Plus the cross-cutting work
 **mutual-TLS inter-service transport**, the **three-package split** (Router
 installs without the Manager), the **rented-GPU node tier** with a **RunPod vendor
 adapter**, warm-node reuse + idle reaping, and a **real OpenAI-compatible inference
-backend** (vLLM / llama.cpp / Ollama). Cloud calls and the local backend degrade to
-deterministic stubs until real endpoints/credentials are supplied. CI runs the
-suite on 3.10–3.12 and verifies the Router builds standalone. See
-`docs/ARCHITECTURE.md` for the section-by-section map.
+backend** (vLLM / llama.cpp / Ollama). **New in this phase:** agentic execution on
+trusted rented private nodes (opt-in, acquire-once-bill-once), capability matching
+(ticket-to-worker filter, not a gate), and broker-side operator view (queue
+visibility + in_review backlog with approve/reject web host). Cloud calls and the
+local backend degrade to deterministic stubs until real endpoints/credentials are
+supplied. CI runs the suite on 3.10–3.12 and verifies the Router builds standalone.
+See `docs/ARCHITECTURE.md` for the section-by-section map.
 
 ## License
 

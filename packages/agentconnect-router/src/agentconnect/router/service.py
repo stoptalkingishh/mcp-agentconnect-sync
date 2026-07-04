@@ -248,13 +248,27 @@ class RouterService:
         except Exception as exc:  # advisory hint only; never fails the enqueue
             self.memory.append_log(task_id, f"enqueue_task advisory routing failed: {exc}", level="warn")
 
+        # Capabilities are a MATCHING FILTER only, never authorization: an
+        # explicit caller-supplied list wins; otherwise default from the
+        # agent_type mapping so claim_next's existing subset filter actually
+        # binds (an empty list matches everything and was effectively
+        # vacuous). A worker under-declaring simply isn't offered the ticket;
+        # a worker over-declaring gets work it may fail, which the
+        # verification gate (in_review) catches. The tier x privacy boundary
+        # above is the only authorization gate and is unchanged by this.
+        caps = (
+            list(required_capabilities)
+            if required_capabilities is not None
+            else list(self._capabilities_for(submission.agent_type))
+        )
+
         return self.workqueue.add(
             task=submission.task,
             origin=f"router:{submission.agent_type or 'unknown'}",
             privacy_class=privacy_class,
             payload_ref=payload_ref,
             task_id=task_id,
-            required_capabilities=required_capabilities,
+            required_capabilities=caps,
             priority=priority,
             dedup_key=dedup_key,
             depends_on=depends_on,
@@ -388,19 +402,49 @@ class RouterService:
         assert cfg is not None
 
         # Agentic execution runs the worker runtime's tool loop in-process and
-        # feeds each tool observation back to the model, so it may run only on a
-        # local resident model — never an external/rented provider. Fail closed
-        # here (a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED) before any spend.
-        if submission.constraints.execution == "agentic" and cfg.type != "local":
-            self._transition(task_id, state, TaskState.REJECTED)
-            self.memory.update_task(
-                task_id, state=TaskState.REJECTED.value,
-                summary=f"Agentic execution needs a local provider; routing selected "
-                f"{cfg.provider_id} ({cfg.type}).",
-                recommended_next_action="Resubmit as one-shot, or constrain the task so a "
-                "local model is eligible.",
+        # feeds each tool observation back to the model. Those tool observations
+        # must never reach an untrusted external model, so agentic is permitted
+        # only on (a) an OWNED local resident model, or (b) a TRUSTED, opted-in
+        # rented PRIVATE node — a box running YOUR weights ephemerally with no
+        # external logging (the whole point of the rented tier). Cloud
+        # (external/external_paid) is always rejected; secret_sensitive never
+        # reaches here (blocked pre-routing). This guard is belt-and-suspenders:
+        # even if routing selected rented for a public task without opt-in/trust,
+        # we fail closed. It is a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED,
+        # kept BEFORE any spend confirmation so a rejected route never bills.
+        if submission.constraints.execution == "agentic":
+            is_owned_local = cfg.type == "local" and not RoutingEngine._is_rented(cfg)
+            rented_ok = (
+                RoutingEngine._is_rented(cfg)
+                and submission.constraints.allow_rented
+                and RoutingEngine._rented_trust_ok(cfg)
             )
-            return self._summary(task_id)
+            if not (is_owned_local or rented_ok):
+                self._transition(task_id, state, TaskState.REJECTED)
+                if RoutingEngine._is_rented(cfg):
+                    summary = (
+                        f"Agentic execution on a rented node ({cfg.provider_id}) needs "
+                        "allow_rented=True and a node whose trust satisfies the repo_sensitive "
+                        "policy (ephemeral/encrypted_volume/own_image/no_external_logging)."
+                    )
+                    next_action = (
+                        "Set allow_rented=True and route to a trusted private rented node, or "
+                        "resubmit as one-shot."
+                    )
+                else:
+                    summary = (
+                        "Agentic execution needs a local or trusted rented node; routing "
+                        f"selected {cfg.provider_id} ({cfg.type})."
+                    )
+                    next_action = (
+                        "Resubmit as one-shot, or constrain the task so a local (or trusted "
+                        "rented) model is eligible."
+                    )
+                self.memory.update_task(
+                    task_id, state=TaskState.REJECTED.value,
+                    summary=summary, recommended_next_action=next_action,
+                )
+                return self._summary(task_id)
 
         # Deterministic per-charge user confirmation for real-money routes, BEFORE
         # queueing (so a decline is a legal ELIGIBLE_PROVIDERS_COMPUTED -> REJECTED).
@@ -500,7 +544,14 @@ class RouterService:
         """Execute the task through the worker runtime's act/tool loop instead of
         a single generation. The model is reached through the gateway (same
         provider/secrets/mTLS as one-shot); token usage is summed across steps
-        and reconciled once. Reached only for local providers (guarded above)."""
+        and reconciled once. Reached only for owned-local or trusted-rented
+        providers (guarded above)."""
+        # A rented private node cannot be served through the gateway (it neither
+        # provisions nor bills), so agentic on a trusted rented tier takes a
+        # dedicated path that acquires the node ONCE, reuses it across every
+        # step, bills the rental window once, and releases/reaps after.
+        if RoutingEngine._is_rented(cfg):
+            return self._run_agentic_rented(cfg, submission, task_id, state, max_out)
         # Lazy import: one-shot-only deployments need not install the runtime
         # (and its langgraph dependency).
         from agentconnect.runtime import LangGraphAgentRuntime, RuntimeConfig
@@ -572,6 +623,116 @@ class RouterService:
             # The loop stopped without a finish (e.g. step cap). Not an exception,
             # but not a success either — surface it as FAILED with the runtime's
             # own risks/next-action so the manager can decide.
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=self._first_line(worker.summary) or "Agentic task did not complete.",
+                recommended_next_action=worker.recommended_next_action
+                or "Raise the step limit or narrow the task, then retry.",
+            )
+        return self._summary(task_id)
+
+    def _run_agentic_rented(
+        self, cfg, submission: TaskSubmission, task_id: str, state: TaskState, max_out: int,
+    ) -> TaskSummary:
+        """Agentic tool loop on a TRUSTED, opted-in rented private node.
+
+        Mirrors ``_dispatch``'s rented branch but acquires the node ONCE, OUTSIDE
+        the loop, and reuses it across every step. Privacy: each per-step
+        ``generate()`` reaches the acquired node's own mTLS ``LocalClient`` (your
+        weights, ephemeral, no external logging — trust-gated by the caller's
+        guard), never ``gateway._call_cloud`` — so a repo-sensitive tool trace
+        never leaves the rented tier. Billing: the rental window is recorded
+        EXACTLY ONCE, at spin-up (only when not reused), outside the loop; the
+        per-step generates never bill. Rented is ``cfg.type=="local"`` so
+        ``submit_task`` reserved no cloud quota (there is no reconcile / second
+        money path). Token totals feed only the evaluation record, as one-shot
+        rented does. The node is always released in ``finally`` for the reaper."""
+        from agentconnect.runtime import LangGraphAgentRuntime, RuntimeConfig
+        from .runtime_dispatch import RentedModelSource
+        from .provisioning import NodePool, spec_from_provider
+
+        model_id = submission.constraints.require_exact_model or self.profiles.default_resident_model
+        pool = self.node_pool or NodePool()
+        spec = spec_from_provider(cfg, model_id=model_id)
+        factory = self.rented_client_factory or self._default_rented_client
+
+        # Provisioning, client wiring, billing AND the loop all run inside one
+        # try so an operational spin-up failure (provisioner.wait_ready raising
+        # because the node never boots) degrades to a FAILED TaskSummary instead
+        # of escaping raw to the MCP caller — matching the one-shot rented path's
+        # contract (_dispatch runs under submit_task's try). The finally still
+        # releases even when a *post-acquire* step (factory / billing) raises, so
+        # a just-provisioned node is never left un-released. release() is a safe
+        # no-op when acquire never populated the pool. ``source`` may be None if
+        # we failed before constructing it, so the except guards token totals.
+        source = None
+        handle = None
+        started = time.perf_counter()
+        try:
+            handle, reused = pool.acquire(cfg, self.provisioner, spec)
+            client = factory(cfg, handle)
+            # Bill the rental window once, at spin-up (mirrors _dispatch); warm reuse is free.
+            if not reused:
+                window = cfg.rental.min_rental_seconds if cfg.rental else 0
+                self.quota.record_rental_window(cfg, task_id, seconds=window)
+            source = RentedModelSource(client, model_id)
+            runtime = LangGraphAgentRuntime(
+                source, RuntimeConfig(model_id=model_id, max_output_tokens=max_out)
+            )
+            worker = runtime.run(submission, task_id=task_id)
+        except Exception as exc:  # setup/runtime failure -> FAILED (no cloud quota to reconcile).
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            in_tok = source.total_input_tokens if source is not None else 0
+            out_tok = source.total_output_tokens if source is not None else 0
+            self._record_eval(
+                cfg, model_id, task_id, submission.agent_type, "failed", latency_ms,
+                in_tok, out_tok, 0.0,
+            )
+            self.memory.append_log(task_id, f"agentic_run_failed: {exc}", level="error")
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=f"Agentic run on rented node {cfg.provider_id} failed.",
+                recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
+            )
+            return self._summary(task_id)
+        finally:
+            # Free the node for the idle reaper even if setup or the loop raised.
+            pool.release(cfg)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        in_tok, out_tok = source.total_input_tokens, source.total_output_tokens
+        cost = self.quota.estimate_cost_usd(cfg, in_tok, out_tok)
+        eval_status = "completed" if worker.status == "completed" else "failed"
+        self._record_eval(
+            cfg, model_id, task_id, submission.agent_type, eval_status,
+            latency_ms, in_tok, out_tok, cost, confidence=worker.confidence,
+        )
+
+        output_ref = self.memory.put_artifact(
+            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+        )
+        self.memory.append_log(
+            task_id, f"agentic provider={cfg.provider_id} model={model_id} "
+            f"rented_node={handle.node_id} steps={source.calls} status={worker.status} "
+            f"confidence={worker.confidence} in={in_tok} out={out_tok} "
+            f"changed={len(worker.changed_artifacts)} output_ref={output_ref}"
+        )
+
+        if worker.status == "completed":
+            state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
+            state = self._transition(task_id, state, TaskState.CHECKS_RUN)
+            state = self._transition(task_id, state, TaskState.REVIEW_READY)
+            state = self._transition(task_id, state, TaskState.APPROVED)
+            self._transition(task_id, state, TaskState.COMPLETE)
+            self.memory.update_task(
+                task_id, state=TaskState.COMPLETE.value,
+                summary=self._first_line(worker.summary) or "Agentic task completed.",
+                recommended_next_action=worker.recommended_next_action
+                or "Read the output artifact chunk if details are needed.",
+            )
+        else:
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
                 task_id, state=TaskState.FAILED.value,

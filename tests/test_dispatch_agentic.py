@@ -73,7 +73,8 @@ def test_agentic_on_an_external_provider_is_rejected():
     summary = svc.submit_task(sub)
 
     assert summary.status == TaskState.REJECTED
-    assert "local provider" in (summary.summary or "").lower()
+    # Cloud is neither owned-local nor a trusted rented node.
+    assert "local or trusted rented node" in (summary.summary or "").lower()
     # It really did try to route to cloud — the guard, not some earlier gate, caught it.
     decisions = svc.memory.get_routing_decisions(summary.task_id)
     assert decisions[-1]["selected_provider"] in {"gemini_free", "groq_free"}

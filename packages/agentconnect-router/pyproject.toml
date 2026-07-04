@@ -25,6 +25,8 @@ embedded = ["agentconnect-model-manager==0.2.0"]
 # never hard-imports it, so one-shot-only deployments can skip it.
 agentic = ["agentconnect-runtime==0.1.0"]
 # Reference web approve/deny host for the spend authorizer (AGENTCONNECT_SPEND_AUTHORIZER=web).
+# Also serves the read-only queue operator host (agentconnect.router.queue_web) --
+# never mounted by default, opt-in only. No new dependency: same fastapi/uvicorn.
 web = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]

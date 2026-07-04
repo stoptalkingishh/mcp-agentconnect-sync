@@ -16,6 +16,7 @@ from __future__ import annotations
 from ..common.config import ProviderConfig
 from ..common.schemas import GenerateRequest, GenerateResponse
 from .gateway import ProviderGateway
+from .local_client import LocalClient
 
 
 class GatewayModelSource:
@@ -51,5 +52,41 @@ class GatewayModelSource:
             output_text=result.output_text,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            finish_reason="stop",
+        )
+
+
+class RentedModelSource:
+    """A runtime ModelSource backed by an ALREADY-ACQUIRED rented node's client.
+
+    The gateway cannot serve a rented node (it provisions/bills nothing — it would
+    fall back to the owned local client or a bare HTTP endpoint), so agentic runs
+    on a rented tier reach the model directly through the ``LocalClient`` the
+    router built for the node it acquired. The node is provisioned, billed for its
+    rental window, and released EXACTLY ONCE by the caller around the whole loop;
+    this source only pins the model and sums usage across steps, mirroring
+    :class:`GatewayModelSource` so the caller reconciles the task as a whole.
+    """
+
+    def __init__(self, client: LocalClient, model_id: str):
+        self._client = client
+        self._model_id = model_id
+        self.calls = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+
+    def generate(self, req: GenerateRequest) -> GenerateResponse:
+        # Pin the model to the routing decision (see GatewayModelSource.generate).
+        call_req = req.model_copy(update={"model_id": self._model_id})
+        resp = self._client.generate(call_req)
+        self.calls += 1
+        self.total_input_tokens += resp.input_tokens
+        self.total_output_tokens += resp.output_tokens
+        return GenerateResponse(
+            request_id=req.request_id,
+            model_id=resp.model_id,
+            output_text=resp.output_text,
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
             finish_reason="stop",
         )

@@ -677,6 +677,109 @@ class WorkQueue:
             ).fetchall()
         return [self._status_row(r) for r in rows]
 
+    def open_capability_requirements(self) -> list[dict[str, Any]]:
+        """Distinct required-capability sets among OPEN tickets, with counts —
+        lets an operator spot "no worker can ever claim this" without exposing
+        any payload. Capabilities remain a matching filter only (never an
+        authorization boundary); this is observability, not a gate."""
+        rows = self._conn.execute(
+            "SELECT required_capabilities AS rc FROM work_queue WHERE status='open'"
+        ).fetchall()
+        # Group by the capability SET, not the raw JSON text: two tickets that
+        # require the same capabilities but serialized their list in a different
+        # order (e.g. ["a","b"] vs ["b","a"]) are ONE requirement, so we
+        # normalize each to a sorted, de-duplicated tuple before counting.
+        # Doing this in Python (not SQL GROUP BY) is what keeps the
+        # "no capable worker can ever claim this" signal from fragmenting.
+        counts: dict[tuple[str, ...], int] = {}
+        for r in rows:
+            key = tuple(sorted(set(json.loads(r["rc"] or "[]"))))
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"required_capabilities": list(key), "open_tickets": n}
+            for key, n in sorted(counts.items())
+        ]
+
+    def _operator_row(self, row: Any) -> dict[str, Any]:
+        """Broader payload-free projection for the operator surface: adds
+        capabilities/provenance/refs/timestamps on top of ``_status_row``. Still
+        NEVER the payload/result content, and never ``task_id`` (a live handle
+        into the un-redacted submission) — only ids, tiers, status, and the
+        provenance audit trail."""
+        d = dict(row)
+        derived = d["status"]
+        if derived == "open" and self._is_blocked(d["ticket_id"]):
+            derived = "blocked"
+        return {
+            "ticket_id": d["ticket_id"],
+            "status": derived,
+            "privacy_class": d["privacy_class"],
+            "allowed_tiers": json.loads(d["allowed_tiers"] or "[]"),
+            "required_capabilities": json.loads(d["required_capabilities"] or "[]"),
+            "priority": d["priority"],
+            "attempts": d["attempts"],
+            "max_attempts": d["max_attempts"],
+            "result_status": d["result_status"],
+            "assignee": d["assignee"],
+            "park_reason": d["park_reason"],
+            "origin": d["origin"],
+            "payload_ref": d["payload_ref"],
+            "result_ref": d["result_ref"],
+            "provenance": json.loads(d["provenance"] or "[]"),
+            "created_at": d["created_at"],
+            "updated_at": d["updated_at"],
+        }
+
+    def list_tickets(
+        self,
+        status: Optional[str] = None,
+        privacy_class: Optional[Union[str, PrivacyClass]] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Operator-facing ticket listing, payload-free (see ``_operator_row``).
+        Optional filters on status and/or privacy_class; ordered most-recently-
+        updated first."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if privacy_class is not None:
+            clauses.append("privacy_class=?")
+            params.append(_class_value(privacy_class))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM work_queue{where} ORDER BY updated_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [self._operator_row(r) for r in rows]
+
+    def pending_review(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The ``in_review`` backlog awaiting a local_only reviewer's
+        ``approve``/``reject`` — the human-spot-check triage queue."""
+        return self.list_tickets(status="in_review", limit=limit)
+
+    def stats(self) -> dict[str, Any]:
+        """Counts by status and by privacy_class, plus the distinct open
+        capability requirements — a payload-free operator dashboard summary."""
+        by_status = {
+            r["status"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM work_queue GROUP BY status"
+            ).fetchall()
+        }
+        by_privacy = {
+            r["privacy_class"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT privacy_class, COUNT(*) AS n FROM work_queue GROUP BY privacy_class"
+            ).fetchall()
+        }
+        return {
+            "by_status": by_status,
+            "by_privacy_class": by_privacy,
+            "capability_requirements": self.open_capability_requirements(),
+        }
+
     def _is_blocked(self, ticket_id: str) -> bool:
         # Blocked iff any dependency edge lacks a parent that is 'done' — a
         # dangling edge (parent missing) counts as unsatisfied (fail-closed),

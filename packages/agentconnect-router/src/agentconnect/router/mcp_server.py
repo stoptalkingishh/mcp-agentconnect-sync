@@ -433,6 +433,37 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
             return _json({"error": "unknown_worker_identity"})
         return _json(wq.reject(reviewer_id, tier, ticket_id, reason=reason))
 
+    # ------------------------------------------------------- operator (read-only)
+    @mcp.tool()
+    def queue_list(
+        status: Optional[str] = None, privacy_class: Optional[str] = None, limit: int = 100
+    ) -> str:
+        """OPERATOR tool: payload-free ticket listing (metadata, refs, tiers,
+        capabilities, provenance — NEVER payload/result content). Read-only; may
+        run without a worker identity. Optional status/privacy_class filters."""
+        wq = _wq()
+        if wq is None:
+            return _json({"error": "workqueue_unavailable"})
+        return _json(wq.list_tickets(status=status, privacy_class=privacy_class, limit=limit))
+
+    @mcp.tool()
+    def queue_pending(limit: int = 100) -> str:
+        """OPERATOR tool: the in_review backlog awaiting a local_only reviewer's
+        queue_approve/queue_reject. Read-only, payload-free."""
+        wq = _wq()
+        if wq is None:
+            return _json({"error": "workqueue_unavailable"})
+        return _json(wq.pending_review(limit=limit))
+
+    @mcp.tool()
+    def queue_stats() -> str:
+        """OPERATOR tool: counts by status/privacy_class plus distinct open
+        capability requirements. Read-only, payload-free."""
+        wq = _wq()
+        if wq is None:
+            return _json({"error": "workqueue_unavailable"})
+        return _json(wq.stats())
+
     @mcp.tool()
     def enqueue_task(
         task: str,
