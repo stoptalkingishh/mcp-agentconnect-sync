@@ -175,6 +175,33 @@ loop in-process (`HttpAgentRuntime` is a drop-in `AgentRuntime`), gated by the s
 fail-closed trust predicate as the pull queue. See
 [REMOTE_DISPATCH.md](REMOTE_DISPATCH.md).
 
+## Bring Your Own Runtime (public extension point)
+
+The entire runtime contract is one structural protocol — implement it and the router
+drives your code with no rewrite of your agent:
+
+```python
+class AgentRuntime(Protocol):
+    def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult: ...
+```
+
+If you already have a compiled **LangGraph** (or CrewAI, or hand-rolled) agent, wrap it
+in a class whose `run()` invokes your graph and marshals the outcome into a
+`WorkerResult`. Two ways to plug it in — both inherit AgentConnect's privacy×tier
+routing, multi-harness managers, and federation, none of which the agent framework
+provides:
+
+- **In-process** — inject `local_runtime_factory=lambda source, config: YourRuntime(...)`
+  into `RouterService.create(...)`. Agentic tasks then run through your runtime instead
+  of the built-in `LangGraphAgentRuntime`. (`source` is a `ModelSource` bound to the
+  routing decision; use it or ignore it if your graph owns its own model.)
+- **Federated** — serve your runtime with `create_worker_app(your_runtime)` (a `POST
+  /run` that takes `{task_id, submission}` → `WorkerResult`), register it in
+  `remote_workers.yaml`, and the router pushes to it over mTLS.
+
+Either way, a manager harness (Claude Code, Codex, Cursor, opencode) drives it end-to-end
+through the vanilla `submit_task(execution="agentic")` MCP tool.
+
 ## How It Connects To The Router
 
 The router already defines the control-plane contract:

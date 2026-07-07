@@ -44,6 +44,47 @@ def test_agentic_task_runs_through_the_runtime_loop():
     assert decisions[-1]["selected_provider"] == "local_r9700"
 
 
+def test_local_runtime_factory_injects_a_custom_agentruntime():
+    # Bring-your-own-runtime seam: a custom AgentRuntime (e.g. wrapping an existing
+    # LangGraph/CrewAI graph) is injected via local_runtime_factory and the router
+    # folds its WorkerResult end-to-end — no built-in LangGraph loop involved.
+    from agentconnect.common.schemas import WorkerResult
+
+    ran = {"n": 0, "task": None, "task_id": None}
+
+    class FakeRuntime:
+        def __init__(self, source, config):
+            self.source, self.config = source, config
+
+        def run(self, task, task_id="task_local"):
+            ran["n"] += 1
+            ran["task"] = task.task
+            ran["task_id"] = task_id
+            return WorkerResult(
+                status="completed", summary="custom runtime ran",
+                confidence=0.77, changed_artifacts=["out.txt"],
+            )
+
+    svc = RouterService.create(
+        memory=SharedMemory(),
+        local_client=InProcessLocalClient(ResidencyManager()),
+        local_runtime_factory=lambda source, config: FakeRuntime(source, config),
+    )
+    sub = TaskSubmission(
+        task="Do the private refactor.",
+        agent_type="patch_worker",
+        constraints=TaskConstraints(privacy_class="repo_sensitive", execution="agentic"),
+    )
+    summary = svc.submit_task(sub)
+
+    assert summary.status == TaskState.COMPLETE
+    assert ran["n"] == 1 and ran["task"] == "Do the private refactor."
+    assert ran["task_id"] == summary.task_id
+    chunk = svc.read_artifact_chunk(summary.artifacts["output"])
+    assert "custom runtime ran" in chunk["content"]
+    assert '"confidence": 0.77' in chunk["content"]
+
+
 def test_oneshot_is_the_default_and_stays_a_single_generation():
     svc = _local_service()
     sub = TaskSubmission(

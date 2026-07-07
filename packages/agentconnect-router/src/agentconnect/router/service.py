@@ -86,6 +86,13 @@ class RouterService:
     # TestClient-backed runtime with no real network.
     remote_workers: list[RemoteWorkerConfig] = field(default_factory=list)
     remote_runtime_factory: Optional[Callable[[RemoteWorkerConfig], Any]] = None
+    # In-process runtime injection: swap the local agentic runtime for your own
+    # AgentRuntime (e.g. a wrapper around an existing LangGraph/CrewAI graph) without
+    # editing the router. Signature (ModelSource, RuntimeConfig) -> AgentRuntime.
+    # None -> lazily build the built-in LangGraphAgentRuntime (so one-shot-only
+    # deployments never import the runtime / its langgraph dependency). See
+    # _make_local_runtime and docs/AGENT_RUNTIME.md ("Bring your own runtime").
+    local_runtime_factory: Optional[Callable[[Any, Any], Any]] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -97,6 +104,7 @@ class RouterService:
         provisioner: Optional["NodeProvisioner"] = None,
         rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None,
         authorizer: Optional[SpendAuthorizer] = None,
+        local_runtime_factory: Optional[Callable[[Any, Any], Any]] = None,
     ) -> "RouterService":
         providers_cfg, profiles, routing_cfg = load_all()
         mem = memory or SharedMemory()
@@ -129,7 +137,21 @@ class RouterService:
             authorizer=authorizer or DenyingSpendAuthorizer(),
             remote_workers=load_remote_workers(),
             remote_runtime_factory=_default_remote_runtime,
+            # None stays None here on purpose: _make_local_runtime lazily builds the
+            # built-in runtime so a one-shot-only deployment need not install it.
+            local_runtime_factory=local_runtime_factory,
         )
+
+    def _make_local_runtime(self, source, config):
+        """Build the in-process agentic runtime. Uses an injected
+        ``local_runtime_factory`` when set (bring-your-own AgentRuntime), else lazily
+        constructs the built-in ``LangGraphAgentRuntime`` — the lazy import keeps
+        one-shot-only deployments free of the runtime/langgraph dependency."""
+        if self.local_runtime_factory is not None:
+            return self.local_runtime_factory(source, config)
+        from agentconnect.runtime import LangGraphAgentRuntime
+
+        return LangGraphAgentRuntime(source, config)
 
     # ----------------------------------------------------------- evaluation
     def _record_eval(self, cfg, model, task_id, agent_type, status, latency_ms,
@@ -718,13 +740,14 @@ class RouterService:
         if RoutingEngine._is_rented(cfg):
             return self._run_agentic_rented(cfg, submission, task_id, state, max_out)
         # Lazy import: one-shot-only deployments need not install the runtime
-        # (and its langgraph dependency).
-        from agentconnect.runtime import LangGraphAgentRuntime, RuntimeConfig
+        # (and its langgraph dependency). RuntimeConfig is data; the runtime impl is
+        # resolved through _make_local_runtime (injectable).
+        from agentconnect.runtime import RuntimeConfig
         from .runtime_dispatch import GatewayModelSource
 
         model_id = submission.constraints.require_exact_model or self.profiles.default_resident_model
         source = GatewayModelSource(self.gateway, cfg, model_id)
-        runtime = LangGraphAgentRuntime(
+        runtime = self._make_local_runtime(
             source,
             RuntimeConfig(model_id=model_id, max_output_tokens=max_out),
         )
@@ -813,7 +836,7 @@ class RouterService:
         ``submit_task`` reserved no cloud quota (there is no reconcile / second
         money path). Token totals feed only the evaluation record, as one-shot
         rented does. The node is always released in ``finally`` for the reaper."""
-        from agentconnect.runtime import LangGraphAgentRuntime, RuntimeConfig
+        from agentconnect.runtime import RuntimeConfig
         from .runtime_dispatch import RentedModelSource
         from .provisioning import NodePool, spec_from_provider
 
@@ -842,7 +865,7 @@ class RouterService:
                 window = cfg.rental.min_rental_seconds if cfg.rental else 0
                 self.quota.record_rental_window(cfg, task_id, seconds=window)
             source = RentedModelSource(client, model_id)
-            runtime = LangGraphAgentRuntime(
+            runtime = self._make_local_runtime(
                 source, RuntimeConfig(model_id=model_id, max_output_tokens=max_out)
             )
             worker = runtime.run(submission, task_id=task_id)
