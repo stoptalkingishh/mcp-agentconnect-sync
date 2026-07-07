@@ -1,9 +1,64 @@
 # mcp-agentconnect
 
-A two-service agent infrastructure that lets **Claude Code** (or any manager
-agent) delegate work through **MCP** while a deterministic control plane routes
-each task to the best available model provider — local GPU, free-tier cloud, or
-paid cloud — without wasting scarce quota or leaking sensitive context.
+**TL;DR** — Give **Claude Code** (or any agent) a set of MCP tools that hand tasks
+off to a control plane. It classifies each task, keeps sensitive context out of
+the wrong models, and routes to the cheapest capable model — your local GPU, a
+free cloud tier, or paid cloud — then returns a **compact summary + artifact
+references** instead of dumping everything back into context. Runs end-to-end
+**today with no GPU** (a built-in stub model); plug in one model server for real
+output.
+
+## Get set up (≈2 minutes, no GPU)
+
+```bash
+git clone <this-repo> && cd mcp-agentconnect
+python -m venv .venv && source .venv/bin/activate
+pip install -e packages/agentconnect-core \
+            -e packages/agentconnect-router \
+            -e packages/agentconnect-model-manager \
+            -e packages/agentconnect-runtime
+pytest -q          # 333 passing, fully offline — confirms the install works
+```
+
+That installs the `agentconnect-router` command. You're done — nothing else is
+required to try it.
+
+## Use it
+
+**1. See it work — no config, no GPU:**
+
+```bash
+python examples/demo.py             # submit tasks; watch classify → route → summarize
+python examples/federation_demo.py  # a friend's box drains a shared queue, privacy enforced
+```
+
+**2. Wire it into Claude Code** — add to your `.mcp.json`:
+
+```json
+{ "mcpServers": { "agentconnect": { "command": "agentconnect-router" } } }
+```
+
+Claude Code now has tools like `submit_task`, `queue_add`, and
+`read_artifact_chunk` ([full list below](#mcp-tools-23)). Out of the box, tasks
+route to a **built-in stub model** (deterministic echo), so the entire pipeline
+works with zero infrastructure.
+
+**3. Get real model output** — point the Model Manager at any OpenAI-compatible
+server (Ollama, vLLM, llama.cpp, SGLang). On a single box the Router embeds the
+manager, so no TLS/second process is needed:
+
+```bash
+export MODEL_MANAGER_BACKEND=openai
+export MODEL_BACKEND_URL=http://localhost:11434/v1   # e.g. Ollama
+agentconnect-router
+```
+
+That model server is the **only** external thing you supply. Free/paid cloud
+providers, a separate GPU box over mutual TLS, and remote-worker dispatch are all
+optional — see [Production](#production-two-machines-over-mutual-tls) and the
+sections below.
+
+---
 
 The point is **not** to bypass token costs. It is **hierarchical context
 management**: the manager agent receives compact summaries and artifact
@@ -60,7 +115,7 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 322 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # 333 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end router walkthrough, no GPU required
 examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
@@ -68,26 +123,11 @@ docs/WORK_QUEUE.md           # federated pull-based work queue design
 docs/REMOTE_DISPATCH.md      # router-driven remote-worker push dispatch
 ```
 
-## Quick start
+## Production: two machines over mutual TLS
 
-```bash
-pip install -e packages/agentconnect-core \
-            -e packages/agentconnect-router \
-            -e packages/agentconnect-model-manager \
-            -e packages/agentconnect-runtime
-pytest -q                      # 322 passing, fully offline
-python examples/demo.py             # end-to-end: submit tasks, see compact summaries
-python examples/federation_demo.py  # watch a friend's box drain the queue, denials and all
-```
-
-The Router is the product and installs **without** the Model Manager:
-
-```bash
-pip install -e packages/agentconnect-core -e packages/agentconnect-router
-agentconnect-router            # cloud-only standalone; local-only tasks report "no local node"
-```
-
-### Run the two services (mutual TLS, no shared secret)
+For a real deployment you split the Router (Machine A, decisions) from the Local
+Model Manager (Machine B, a GPU inference appliance). They authenticate by
+**client certificate — no bearer token or shared secret crosses the wire**:
 
 ```bash
 # Machine B — Local Model Manager (serves HTTPS + requires a client cert)
@@ -95,6 +135,8 @@ export MODEL_MANAGER_TLS_CERT=/certs/server.crt
 export MODEL_MANAGER_TLS_KEY=/certs/server.key
 export MODEL_MANAGER_TLS_CA=/certs/ca.crt          # trust anchor for router client certs
 export MODEL_MANAGER_ALLOWED_CLIENTS=agentconnect-router-01   # optional identity allowlist
+export MODEL_MANAGER_BACKEND=openai                # front a real vLLM/llama.cpp/Ollama server
+export MODEL_BACKEND_URL=http://localhost:8000/v1
 agentconnect-model-manager                         # serves https://0.0.0.0:8443 (mTLS)
 
 # Machine A — Agent Router MCP (stdio transport for Claude Code)
@@ -105,19 +147,9 @@ export AGENTCONNECT_LOCAL_CLIENT_KEY=/certs/router.key
 agentconnect-router
 ```
 
-Identity is the certificate — **no bearer token or shared secret crosses the
-wire**. For single-box dev, omit `MODEL_MANAGER_URL` and the Router embeds an
-in-process manager (needs no transport at all).
-
-Register the router with Claude Code (`.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "agentconnect": { "command": "agentconnect-router" }
-  }
-}
-```
+The Router also runs **cloud-only, without the Model Manager** at all — install
+just `agentconnect-core` + `agentconnect-router`; local-only tasks then report
+"no local node" and everything else routes to cloud providers.
 
 ## MCP tools (§23)
 
@@ -323,7 +355,7 @@ A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 322 tests):** the
+**All six phases implemented end-to-end (offline, tested — 333 tests):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
