@@ -1,5 +1,7 @@
 # mcp-agentconnect
 
+> **Part of the [Fascia](https://github.com/Judgernaut777/fascia) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) into one self-hosted, privacy-first agent stack.
+
 A two-service agent infrastructure: Claude Code (or any agent) hands tasks off over MCP; a deterministic router classifies each task, keeps sensitive context out of the wrong models, routes to local GPU / free / paid cloud, and returns compact summaries + artifact references instead of flooding context. Runs end-to-end with no GPU (built-in stub); plug in one model server for real output.
 
 Suggested topics/tags: mcp · claude · llm-routing · agent-infrastructure · local-llm · vllm · ollama · mtls · privacy
@@ -149,6 +151,7 @@ examples/federation_demo.py  # federated work queue: friend contributes compute,
 docs/ARCHITECTURE.md         # detailed design notes + section map
 docs/WORK_QUEUE.md           # federated pull-based work queue design
 docs/REMOTE_DISPATCH.md      # router-driven remote-worker push dispatch
+docs/MULTI_HARNESS.md        # interchangeable manager harnesses over one control plane
 ```
 
 ## Production: two machines over mutual TLS
@@ -178,6 +181,25 @@ agentconnect-router
 The Router also runs **cloud-only, without the Model Manager** at all — install
 just `agentconnect-core` + `agentconnect-router`; local-only tasks then report
 "no local node" and everything else routes to cloud providers.
+
+## Multi-harness: interchangeable managers, one set of subagents
+
+One control-plane instance can be driven by **many interchangeable manager harnesses**
+(Claude Code, Codex, Cursor, opencode…) over the **same subagents** — swap harness even
+mid-task and work keeps flowing, because subagents drain a shared work queue and don't
+care who submitted. Two shapes: **Model A** (a stdio router per harness, all pointed at
+the same `AGENTCONNECT_DB` — zero code, works today) and **Model B** (one shared
+SSE/streamable-HTTP server every harness connects to — coherent single instance, remote
+harnesses):
+
+```bash
+# Model B — one shared HTTP instance
+AGENTCONNECT_MCP_TRANSPORT=streamable-http AGENTCONNECT_MCP_PORT=8760 agentconnect-router
+#   harnesses connect to http://127.0.0.1:8760/mcp   (bind loopback; add TLS/auth before exposing)
+```
+
+See [docs/MULTI_HARNESS.md](docs/MULTI_HARNESS.md) for setup, config snippets, and the
+A-vs-B tradeoffs.
 
 ## MCP tools (§23)
 
