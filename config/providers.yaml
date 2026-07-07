@@ -71,6 +71,10 @@ providers:
     type: cloud
     endpoint: "https://generativelanguage.googleapis.com"
     secret_ref: "op://AI/gemini/api-key"
+    # Cloud calls go through LiteLLM. Gemini's API is NOT OpenAI-compatible, so name a
+    # native LiteLLM model here; without `litellm_model` the gateway calls in
+    # OpenAI-compatible mode against `endpoint` (fine for groq/openai below).
+    litellm_model: "gemini/gemini-1.5-flash"
     privacy: external
     # Generic capability names (summarization/classification/reasoning/coding) are
     # what the router matches on; keep provider-specific tags too for documentation.

@@ -29,6 +29,10 @@ agentic = ["agentconnect-runtime==0.1.0"]
 # Also serves the read-only queue operator host (agentconnect.router.queue_web) --
 # never mounted by default, opt-in only. No new dependency: same fastapi/uvicorn.
 web = ["fastapi>=0.110", "uvicorn>=0.29"]
+# Cloud generation: LiteLLM drives the outbound call to cloud LLM providers
+# (OpenAI-compatible endpoints plus native handlers for Gemini/Anthropic/etc.).
+# Lazily imported by the gateway — local-only / stub deployments never need it.
+cloud = ["litellm>=1.40"]
 
 [project.scripts]
 agentconnect-router = "agentconnect.router.mcp_server:main"

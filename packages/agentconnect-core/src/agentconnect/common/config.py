@@ -117,6 +117,12 @@ class ProviderConfig:
     node_class: str | None = None  # owned | rented (for type == "local")
     tls: TlsClientConfig | None = None
     rental: RentalConfig | None = None
+    # Optional LiteLLM model string for a cloud provider, e.g. "gemini/gemini-1.5-flash"
+    # or "anthropic/claude-3-5-sonnet". When set, the gateway routes the call through
+    # LiteLLM's NATIVE provider handler (so non-OpenAI-compatible APIs like Gemini work);
+    # when unset it falls back to OpenAI-compatible mode against ``endpoint``. Purely a
+    # transport concern — routing/privacy/cost policy are unchanged.
+    litellm_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,7 @@ def load_providers() -> ProviderRegistryConfig:
             node_class=cfg.get("node_class"),
             tls=_parse_tls(cfg.get("tls")),
             rental=_parse_rental(cfg.get("rental")),
+            litellm_model=cfg.get("litellm_model"),
         )
     return ProviderRegistryConfig(
         policy_version=data.get("policy_version", "unknown"),

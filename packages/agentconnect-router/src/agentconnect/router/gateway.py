@@ -15,7 +15,7 @@ ever see the provider id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from ..common.config import ProviderConfig
 from ..common.schemas import GenerateRequest
@@ -37,10 +37,16 @@ class ProviderGateway:
         self,
         secret_resolver: Optional[SecretResolver] = None,
         local_client: Optional[LocalClient] = None,
+        completion_fn: Optional[Callable[..., object]] = None,
     ):
         # SecretResolver is constructed here and kept private to the gateway.
         self._secrets = secret_resolver or SecretResolver()
         self._local = local_client
+        # The cloud call is delegated to LiteLLM (maintained multi-provider I/O).
+        # Injectable so tests exercise the mapping/key-isolation without importing
+        # the heavy SDK; None -> lazily bind ``litellm.completion`` behind the
+        # [cloud] extra. It is a transport seam only — never the routing decision.
+        self._completion_fn = completion_fn
 
     # ----------------------------------------------------------- local wiring
     def bind_local(self, client: LocalClient) -> None:
@@ -72,10 +78,10 @@ class ProviderGateway:
     def _call_cloud(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:
         """Cloud call. Resolves the API key at call time and never returns it.
 
-        This scaffold implements an OpenAI-compatible chat call and degrades to a
-        deterministic stub when the SDK/network/credentials are unavailable, so
-        the pipeline stays exercisable offline. A production build would remove
-        the stub fallback and surface errors.
+        The call itself is delegated to LiteLLM (maintained multi-provider I/O),
+        and degrades to a deterministic stub when the SDK/network/credentials are
+        unavailable, so the pipeline stays exercisable offline. A production build
+        would remove the stub fallback and surface errors.
         """
         try:
             api_key = self._secrets.resolve(cfg.secret_ref)  # noqa: F841  (used below, never logged)
@@ -84,7 +90,7 @@ class ProviderGateway:
 
         if api_key:
             try:
-                return self._http_openai_compatible(cfg, req, api_key)
+                return self._call_via_litellm(cfg, req, api_key)
             except Exception:
                 # Fall through to the deterministic stub rather than leaking why.
                 pass
@@ -98,29 +104,53 @@ class ProviderGateway:
             model=req.model_id,
         )
 
-    def _http_openai_compatible(
+    def _resolve_completion_fn(self) -> Callable[..., object]:
+        """The injected completion function, or ``litellm.completion`` (lazy, behind
+        the [cloud] extra so stub/local-only deployments never import it)."""
+        if self._completion_fn is not None:
+            return self._completion_fn
+        try:
+            from litellm import completion  # type: ignore
+        except ImportError as e:  # pragma: no cover - only without the extra
+            raise RuntimeError(
+                "cloud generation needs the [cloud] extra: pip install "
+                "'agentconnect-router[cloud]'"
+            ) from e
+        return completion
+
+    def _call_via_litellm(
         self, cfg: ProviderConfig, req: GenerateRequest, api_key: str
     ) -> GatewayResult:
-        import httpx
-
-        url = cfg.endpoint.rstrip("/") + "/chat/completions"
-        payload = {
-            "model": req.model_id,
+        """Route the cloud call through LiteLLM. The API key is passed EXPLICITLY
+        per-call and never written to the environment, so the secret stays inside
+        this module (handoff §7/§24). ``litellm_model`` selects a NATIVE provider
+        handler (e.g. ``gemini/...``); otherwise we call in OpenAI-compatible mode
+        against ``cfg.endpoint`` — the prior behavior, now maintained by LiteLLM.
+        """
+        completion = self._resolve_completion_fn()
+        kwargs: dict[str, object] = {
             "messages": req.messages,
             "max_tokens": req.max_output_tokens,
             "temperature": req.temperature,
+            "api_key": api_key,
         }
-        headers = {"Authorization": f"Bearer {api_key}"}
-        with httpx.Client(timeout=60.0) as client:
-            r = client.post(url, json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-        choice = data["choices"][0]["message"]["content"]
-        usage = data.get("usage", {})
+        if cfg.litellm_model:
+            kwargs["model"] = cfg.litellm_model
+            if cfg.endpoint:
+                kwargs["api_base"] = cfg.endpoint.rstrip("/")
+        else:
+            # OpenAI-compatible endpoint (the default): the "openai/" prefix tells
+            # LiteLLM to POST /chat/completions at api_base, matching the old path.
+            kwargs["model"] = f"openai/{req.model_id}"
+            kwargs["api_base"] = cfg.endpoint.rstrip("/")
+
+        resp = completion(**kwargs)
+        choice = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
         return GatewayResult(
             output_text=choice,
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
+            input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
             provider=cfg.provider_id,
             model=req.model_id,
         )
