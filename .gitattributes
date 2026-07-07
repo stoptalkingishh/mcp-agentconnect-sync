@@ -1,0 +1,6 @@
+# Force LF regardless of a contributor's core.autocrlf: install.sh/verify.sh
+# rely on the #!/usr/bin/env bash shebang, which breaks if CRLF ever creeps in.
+deploy/*.sh text eol=lf
+deploy/*.py text eol=lf
+deploy/*.json text eol=lf
+deploy/*.md text eol=lf

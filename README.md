@@ -118,6 +118,10 @@ Register the router with Claude Code (`.mcp.json`):
 }
 ```
 
+Want a scripted install (Windows or Linux/macOS) that also registers with
+Claude Desktop, Cursor, Windsurf, or Cline, and walks you through pasting in
+provider API keys? See [`deploy/README.md`](deploy/README.md).
+
 ## MCP tools (§23)
 
 | Tool | Returns |
