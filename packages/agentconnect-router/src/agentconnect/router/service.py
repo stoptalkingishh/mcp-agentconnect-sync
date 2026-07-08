@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from . import guard_hook
 from ..common import privacy as privacy_mod
 from ..common.authorization import ChargeRequest, DenyingSpendAuthorizer, SpendAuthorizer
 from ..common.budget import BudgetManager
@@ -405,6 +406,22 @@ class RouterService:
             )
             return self._summary(task_id)
 
+        # 4b. Optional fascia-guard pass — adds prompt-injection detection and an
+        # independent secret/PII scan on top of privacy_mod (defense in depth).
+        # Dormant unless FASCIA_GUARD[_ENFORCE] is set; only ENFORCE can reject.
+        guard_verdict = guard_hook.scan_task(submission.task, task_id)
+        if guard_verdict is not None:
+            self.memory.append_log(task_id, guard_hook.describe(guard_verdict, "task"))
+            if guard_hook.enforcing() and guard_hook.is_block(guard_verdict):
+                self._transition(task_id, state, TaskState.REJECTED)
+                self.memory.update_task(
+                    task_id,
+                    state=TaskState.REJECTED.value,
+                    summary="Blocked by fascia-guard: task contains secret/credential material.",
+                    recommended_next_action="Remove/redact the flagged content; do not route to an LLM.",
+                )
+                return self._summary(task_id)
+
         # Router-driven remote-worker dispatch: an agentic task may be PUSHED whole
         # to a registered remote worker whose ATTESTED tier is trusted for this
         # privacy class (the same fail-closed WorkQueue.may_claim predicate the pull
@@ -595,15 +612,23 @@ class RouterService:
             latency_ms, result.input_tokens, result.output_tokens, cost,
         )
 
-        # 15. Store full result in shared memory (never returned inline).
-        output_ref = self.memory.put_artifact(task_id, "output", self._clamp(result.output_text))
+        # 15. Store full result in shared memory (never returned inline). Optional
+        # fascia-guard output scan: when enforcing, persist the redacted form so a
+        # secret leaked in worker output never lands in the artifact/summary.
+        stored_output = result.output_text
+        guard_out = guard_hook.scan_output(result.output_text, task_id)
+        if guard_out is not None:
+            self.memory.append_log(task_id, guard_hook.describe(guard_out, "output"))
+            if guard_hook.enforcing() and guard_hook.should_redact_output(guard_out):
+                stored_output = guard_out.redacted_text
+        output_ref = self.memory.put_artifact(task_id, "output", self._clamp(stored_output))
         state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
         state = self._transition(task_id, state, TaskState.CHECKS_RUN)
         state = self._transition(task_id, state, TaskState.REVIEW_READY)
         state = self._transition(task_id, state, TaskState.APPROVED)
         self._transition(task_id, state, TaskState.COMPLETE)
 
-        summary = self._first_line(result.output_text)
+        summary = self._first_line(stored_output)
         self.memory.update_task(
             task_id, state=TaskState.COMPLETE.value, summary=summary,
             recommended_next_action="Read the output artifact chunk if details are needed.",
