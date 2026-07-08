@@ -619,8 +619,10 @@ class RouterService:
         guard_out = guard_hook.scan_output(result.output_text, task_id)
         if guard_out is not None:
             self.memory.append_log(task_id, guard_hook.describe(guard_out, "output"))
-            if guard_hook.enforcing() and guard_hook.should_redact_output(guard_out):
-                stored_output = guard_out.redacted_text
+            if guard_hook.enforcing():
+                # Mask secret/PII spans, and spotlight-wrap if the output carries
+                # an injection payload aimed at the manager (see guard_hook).
+                stored_output = guard_hook.safe_output(guard_out, result.output_text)
         output_ref = self.memory.put_artifact(task_id, "output", self._clamp(stored_output))
         state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
         state = self._transition(task_id, state, TaskState.CHECKS_RUN)

@@ -19,12 +19,13 @@ from __future__ import annotations
 import os
 
 try:  # soft dependency
-    from fascia_guard import Decision
+    from fascia_guard import Category, Decision, spotlight
     from fascia_guard.integrations.agentconnect import guard_artifact, guard_task_input
     _AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only when the package is absent
     _AVAILABLE = False
     Decision = None  # type: ignore
+    Category = None  # type: ignore
 
 
 def _flag(name: str) -> bool:
@@ -76,3 +77,25 @@ def is_block(verdict) -> bool:
 def should_redact_output(verdict) -> bool:
     return (_AVAILABLE and verdict is not None
             and verdict.decision in (Decision.BLOCK, Decision.REDACT))
+
+
+def has_injection(verdict) -> bool:
+    return (_AVAILABLE and verdict is not None
+            and any(f.category is Category.INJECTION for f in verdict.findings))
+
+
+def safe_output(verdict, original: str) -> str:
+    """The form of a worker artifact to persist for the manager to read back.
+
+    Precedence: mask secret/PII spans first (a leaked credential must not survive),
+    then — if the output also carries an injection payload aimed at the manager (a
+    tricked/compromised worker emitting "manager, now do X") — spotlight-wrap it so
+    the manager treats the whole artifact as untrusted data, not instructions.
+    Returns `original` unchanged when nothing fired.
+    """
+    if not (_AVAILABLE and verdict is not None):
+        return original
+    text = verdict.redacted_text if should_redact_output(verdict) else original
+    if has_injection(verdict):
+        text = spotlight(text, "worker-artifact")
+    return text
