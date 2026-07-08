@@ -377,6 +377,27 @@ class SharedMemory:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def evaluation_latencies(
+        self, provider: str, since_epoch: Optional[float] = None
+    ) -> list[float]:
+        """Raw per-call latencies for `provider` (completed calls only), oldest
+        first. Feeds `get_provider_metrics`'s p50/p95/p99 computation — there is
+        no percentile aggregate in SQL here, just the raw samples to compute one
+        over in Python (`statistics.quantiles`)."""
+        if since_epoch is None:
+            rows = self._conn.execute(
+                "SELECT latency_ms FROM evaluations WHERE provider=? AND status='completed'"
+                " ORDER BY created_at",
+                (provider,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT latency_ms FROM evaluations WHERE provider=? AND status='completed'"
+                " AND created_at >= ? ORDER BY created_at",
+                (provider, since_epoch),
+            ).fetchall()
+        return [float(r["latency_ms"]) for r in rows]
+
     # ------------------------------------------------------------ search_memory
     def search_memory(
         self, query: str, scope: str = "all", limit: int = 20

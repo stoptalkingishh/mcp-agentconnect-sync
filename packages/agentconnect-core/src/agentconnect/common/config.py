@@ -181,6 +181,14 @@ class RoutingConfig:
     def scoring(self) -> dict[str, Any]:
         return self.raw.get("scoring", {})
 
+    @property
+    def resilience(self) -> dict[str, Any]:
+        return self.raw.get("resilience", {})
+
+    @property
+    def compression(self) -> dict[str, Any]:
+        return self.raw.get("compression", {})
+
 
 def _expand(value: str | None) -> str | None:
     return os.path.expandvars(value) if value else value

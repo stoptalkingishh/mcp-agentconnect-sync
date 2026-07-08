@@ -77,9 +77,16 @@ class RoutingEngine:
         self._budget: dict = {
             "configured": False, "remaining_usd": 0.0, "pressure": 0.0, "require_explicit": True,
         }
+        # provider_id -> currently circuit-tripped. Refreshed by the service
+        # (from CircuitBreakerRegistry.is_open) right before each route() call,
+        # same pattern as _budget above.
+        self._circuit_open: set[str] = set()
 
     def set_learned_quality(self, learned: dict[str, float]) -> None:
         self._learned = dict(learned or {})
+
+    def set_circuit_state(self, open_provider_ids: set[str]) -> None:
+        self._circuit_open = set(open_provider_ids or ())
 
     def set_budget_state(
         self, configured: bool, remaining_usd: float, pressure: float, require_explicit: bool
@@ -206,6 +213,8 @@ class RoutingEngine:
 
         if not self.registry.is_available(cfg.provider_id):
             return False, "provider_unhealthy"
+        if cfg.provider_id in self._circuit_open:
+            return False, "circuit_open"
 
         if cfg.type == "cloud":
             if not ctx.allow_external:
