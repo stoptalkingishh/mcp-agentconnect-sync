@@ -1,6 +1,6 @@
 # mcp-agentconnect
 
-> **Part of the [Fascia](https://github.com/Judgernaut777/fascia) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) into one self-hosted, privacy-first agent stack.
+> **Part of the [Fascia](https://github.com/Judgernaut777/Fascia-AI-OS) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) and a shared **guard** ([fascia-guard](https://github.com/Judgernaut777/fascia-guard)) into one self-hosted, privacy-first agent stack.
 
 A two-service agent infrastructure: Claude Code (or any agent) hands tasks off over MCP; a deterministic router classifies each task, keeps sensitive context out of the wrong models, routes to local GPU / free / paid cloud, and returns compact summaries + artifact references instead of flooding context. Runs end-to-end with no GPU (built-in stub); plug in one model server for real output.
 
