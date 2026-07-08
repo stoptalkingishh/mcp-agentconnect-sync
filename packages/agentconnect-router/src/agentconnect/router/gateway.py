@@ -15,8 +15,9 @@ ever see the provider id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
+from ..common.compression import Compressor
 from ..common.config import ProviderConfig
 from ..common.schemas import GenerateRequest
 from ..common.secrets import SecretResolver
@@ -37,14 +38,30 @@ class ProviderGateway:
         self,
         secret_resolver: Optional[SecretResolver] = None,
         local_client: Optional[LocalClient] = None,
+        on_call_result: Optional[Callable[[str, bool, Optional[str]], None]] = None,
+        compressor: Optional[Compressor] = None,
     ):
         # SecretResolver is constructed here and kept private to the gateway.
         self._secrets = secret_resolver or SecretResolver()
         self._local = local_client
+        # Notified (provider_id, success, error) after every real cloud call
+        # attempt — including the one currently swallowed into the stub
+        # fallback below. Used by RouterService to feed a circuit breaker;
+        # never sees secrets, only the provider id and a bool/error string.
+        self._on_result = on_call_result
+        # Compresses outbound cloud message content (tool-output/prose) before
+        # the HTTP payload is built. Cloud-only — local/rented are untouched.
+        self._compressor = compressor
 
     # ----------------------------------------------------------- local wiring
     def bind_local(self, client: LocalClient) -> None:
         self._local = client
+
+    def bind_result_callback(self, callback: Callable[[str, bool, Optional[str]], None]) -> None:
+        self._on_result = callback
+
+    def bind_compressor(self, compressor: Compressor) -> None:
+        self._compressor = compressor
 
     def _local_client_for(self, cfg: ProviderConfig) -> LocalClient:
         if self._local is not None:
@@ -69,6 +86,25 @@ class ProviderGateway:
             )
         return self._call_cloud(cfg, req)
 
+    def _compressed(self, cfg: ProviderConfig, req: GenerateRequest) -> GenerateRequest:
+        """Return `req` with each message's content compressed for this
+        provider, or `req` unchanged if no compressor is bound. A message
+        whose content starts with "OBSERVATION:" (the tool-output convention
+        from runtime/graph.py's act/tool loop) is compressed in tool_output
+        mode; everything else is treated as prose."""
+        if self._compressor is None:
+            return req
+        new_messages = []
+        for m in req.messages:
+            content = m.get("content")
+            if not isinstance(content, str):
+                new_messages.append(m)
+                continue
+            kind = "tool_output" if content.startswith("OBSERVATION:") else "prose"
+            compressed, _stats = self._compressor.compress_for_provider(cfg.provider_id, content, kind)
+            new_messages.append({**m, "content": compressed})
+        return req.model_copy(update={"messages": new_messages})
+
     def _call_cloud(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:
         """Cloud call. Resolves the API key at call time and never returns it.
 
@@ -83,11 +119,20 @@ class ProviderGateway:
             api_key = None
 
         if api_key:
+            call_req = self._compressed(cfg, req)
             try:
-                return self._http_openai_compatible(cfg, req, api_key)
-            except Exception:
-                # Fall through to the deterministic stub rather than leaking why.
-                pass
+                result = self._http_openai_compatible(cfg, call_req, api_key)
+            except Exception as exc:
+                # Still falls through to the deterministic stub below (no
+                # behavior change there — a production build would remove
+                # that fallback and surface errors) but the caller now learns
+                # a real call actually failed, which it could not before.
+                if self._on_result:
+                    self._on_result(cfg.provider_id, False, str(exc))
+            else:
+                if self._on_result:
+                    self._on_result(cfg.provider_id, True, None)
+                return result
 
         text = f"[cloud-stub:{cfg.provider_id}/{req.model_id}] task {req.task_id} (no live call)."
         return GatewayResult(

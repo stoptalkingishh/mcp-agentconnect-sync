@@ -86,3 +86,28 @@ budget:
   # A resident-model task pays no switch penalty; a specialist that is not loaded
   # pays the full model_switch_penalty unless the batch threshold is met.
   quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains
+
+# --- Provider circuit breaker (native reimplementation of the OmniRoute --------
+# resilience concept — no dependency on OmniRoute). A provider that fails
+# `failure_threshold` real calls in a row is marked ineligible ("circuit_open")
+# until `cooldown_seconds` have passed, then gets exactly one half-open probe
+# call before fully closing again.
+resilience:
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    cooldown_seconds: 60
+    # provider_id -> {failure_threshold, cooldown_seconds} overrides, merged
+    # over the defaults above for that one provider.
+    overrides: {}
+
+# --- Outbound payload compression (native reimplementation of the OmniRoute ---
+# compression-pipeline concept — no dependency on OmniRoute, no ML/ONNX engine).
+# Applies only to cloud calls, before the request leaves the gateway. Fenced
+# code blocks, URLs, and short payloads are always left untouched.
+compression:
+  enabled: true
+  apply_to: [tool_output, prose]
+  min_chars_to_compress: 500
+  # provider_id -> {enabled} overrides, merged over `enabled` above.
+  per_provider: {}

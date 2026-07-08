@@ -233,6 +233,36 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
         return _json(svc.search_memory(query, scope=scope, limit=limit))
 
     @mcp.tool()
+    def explain_route(task_id: str) -> str:
+        """Explain why a task was routed the way it was: every recorded
+        routing decision for it (scoring factors per surviving provider,
+        plus every rejected provider and why)."""
+        return _json(svc.explain_route(task_id))
+
+    @mcp.tool()
+    def simulate_route(
+        task: str,
+        agent_type: Optional[str] = None,
+        profile: Optional[str] = None,
+        privacy_class: Optional[str] = None,
+        allow_external: bool = True,
+        allow_paid: bool = False,
+        allow_rented: bool = False,
+        priority: str = "normal",
+        quality: str = "standard",
+    ) -> str:
+        """Dry-run routing: shows which provider WOULD be selected and why,
+        without submitting, dispatching, reserving quota, or confirming any
+        spend. Use this to check a task's routing before committing to it."""
+        return _json(
+            svc.simulate_route(
+                task, agent_type=agent_type, profile=profile, privacy_class=privacy_class,
+                allow_external=allow_external, allow_paid=allow_paid, allow_rented=allow_rented,
+                priority=priority, quality=quality,
+            )
+        )
+
+    @mcp.tool()
     def get_router_status() -> str:
         """Router policy version, providers, live local-manager status, output policy."""
         return _json(svc.get_router_status())
@@ -247,6 +277,21 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
         """Learned per-provider scorecards (success rate, latency, cost, sample
         count) and the current learned-quality signal folded into routing (Phase 6)."""
         return _json(svc.get_provider_scorecards())
+
+    @mcp.tool()
+    def get_provider_metrics(provider_id: Optional[str] = None) -> str:
+        """Per-provider latency percentiles (p50/p95/p99, from raw call
+        samples), current circuit-breaker state, and compression savings.
+        Omit provider_id for all providers."""
+        return _json(svc.get_provider_metrics(provider_id))
+
+    @mcp.tool()
+    def compression_status() -> str:
+        """Current outbound-compression policy (from config) and rolling
+        chars-saved / compression-ratio stats per provider since process
+        start. Compression is config-driven; there is no configure tool —
+        edit config/routing.yaml's `compression` section to change it."""
+        return _json(svc.get_compression_status())
 
     @mcp.tool()
     def set_budget(amount_usd: float, period: str = "monthly") -> str:

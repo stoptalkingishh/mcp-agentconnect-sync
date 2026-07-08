@@ -12,6 +12,7 @@ manager agent receives only summaries + refs.
 
 from __future__ import annotations
 
+import statistics
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from ..common import privacy as privacy_mod
 from ..common.authorization import ChargeRequest, DenyingSpendAuthorizer, SpendAuthorizer
 from ..common.budget import BudgetManager
+from ..common.circuit_breaker import CircuitBreakerRegistry
+from ..common.compression import Compressor
 from ..common.evaluation import Evaluator
 from ..common.config import ProfilesConfig, RoutingConfig, load_all
 from ..common.memory import SharedMemory
@@ -72,6 +75,11 @@ class RouterService:
     # Federated pull work-queue (S1 core), sharing this same memory._conn. Optional
     # only for callers that construct a bare RouterService by hand in tests.
     workqueue: Optional[WorkQueue] = None
+    # Per-cloud-provider circuit breaker + outbound compression (native
+    # reimplementations of OmniRoute resilience/compression concepts).
+    # Optional so a bare hand-constructed RouterService in tests still works.
+    circuit_breaker: Optional[CircuitBreakerRegistry] = None
+    compressor: Optional[Compressor] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -95,7 +103,9 @@ class RouterService:
         from .provisioning import NodePool, StubProvisioner
 
         min_samples = int(routing_cfg.scoring.get("learned_min_samples", 5))
-        return cls(
+        circuit_breaker = CircuitBreakerRegistry.from_config(routing_cfg.resilience)
+        compressor = Compressor.from_config(routing_cfg.compression)
+        svc = cls(
             memory=mem, registry=registry, profiles=profiles, routing_cfg=routing_cfg,
             quota=quota, engine=engine, gateway=gw, local_client=local_client,
             provisioner=provisioner or StubProvisioner(),
@@ -105,7 +115,12 @@ class RouterService:
             node_pool=NodePool(),
             budget=BudgetManager(mem, routing_cfg),
             authorizer=authorizer or DenyingSpendAuthorizer(),
+            circuit_breaker=circuit_breaker,
+            compressor=compressor,
         )
+        gw.bind_result_callback(svc._on_gateway_result)
+        gw.bind_compressor(compressor)
+        return svc
 
     # ----------------------------------------------------------- evaluation
     def _record_eval(self, cfg, model, task_id, agent_type, status, latency_ms,
@@ -118,6 +133,18 @@ class RouterService:
                 "confidence": confidence, "retries": 0,
             }
         )
+
+    def _on_gateway_result(self, provider_id: str, success: bool, error: Optional[str]) -> None:
+        """Bound into ProviderGateway.bind_result_callback at construction time.
+        Feeds the circuit breaker from real call outcomes — including the one
+        `_call_cloud` currently swallows into its stub fallback, which this
+        callback is the only way to see (gateway.py)."""
+        if self.circuit_breaker is None:
+            return
+        if success:
+            self.circuit_breaker.record_success(provider_id)
+        else:
+            self.circuit_breaker.record_failure(provider_id, error)
 
     def get_provider_scorecards(self) -> list[dict[str, Any]]:
         """Per-provider learned scorecards + current learned-quality signal (Phase 6)."""
@@ -242,6 +269,7 @@ class RouterService:
                 cloud_safe=redaction.cloud_safe,
             )
             status = self._local_status()
+            self._refresh_circuit_state()
             decision = self.engine.route(ctx, status)
             self.memory.record_routing_decision(task_id, decision.model_dump(mode="json"))
             assignee = decision.selected_provider
@@ -275,6 +303,51 @@ class RouterService:
             assignee=assignee,
             cloud_safe=redaction.cloud_safe,
         )
+
+    def simulate_route(
+        self,
+        task: str,
+        agent_type: Optional[str] = None,
+        profile: Optional[str] = None,
+        privacy_class: Optional[str] = None,
+        allow_external: bool = True,
+        allow_paid: bool = False,
+        allow_rented: bool = False,
+        priority: str = "normal",
+        quality: str = "standard",
+    ) -> dict[str, Any]:
+        """Dry-run routing (OmniRoute's `simulate_route` concept): runs the same
+        classify -> redact -> route pipeline as `submit_task`, but never
+        dispatches, reserves quota, confirms spend, or writes a task/routing
+        decision to shared memory — a pure "what would happen" query."""
+        hints = ClassificationHints(declared=PrivacyClass(privacy_class) if privacy_class else None)
+        cls_privacy_class = privacy_mod.classify(task, hints)
+        redaction, _redacted_text = privacy_mod.redact(task, cls_privacy_class)
+
+        max_out = int(self.routing_cfg.local_inference_defaults.get("default_max_output_tokens", 1200))
+        in_tok, out_tok = estimate_io_tokens(task, max_out)
+
+        ctx = RoutingContext(
+            task_id=f"sim_{uuid.uuid4().hex[:10]}",
+            privacy_class=cls_privacy_class,
+            needed_capabilities=self._capabilities_for(agent_type),
+            profile=profile,
+            est_input_tokens=in_tok,
+            est_output_tokens=out_tok,
+            allow_external=allow_external,
+            allow_paid=allow_paid,
+            allow_rented=allow_rented,
+            priority=Priority(priority),
+            quality="high" if quality == "high" else "standard",
+            cloud_safe=redaction.cloud_safe,
+        )
+        status = self._local_status()
+        if self.evaluator is not None:
+            self.engine.set_learned_quality(self.evaluator.learned_quality())
+        self._refresh_budget_state()
+        self._refresh_circuit_state()
+        decision = self.engine.route(ctx, status)
+        return decision.model_dump(mode="json")
 
     def _default_rented_client(self, cfg, handle) -> LocalClient:
         from .local_client import HttpLocalClient
@@ -772,6 +845,19 @@ class RouterService:
     def search_memory(self, query: str, scope: str = "all", limit: int = 20) -> list[dict[str, Any]]:
         return self.memory.search_memory(query, scope=scope, limit=limit)
 
+    def explain_route(self, task_id: str) -> dict[str, Any]:
+        """OmniRoute's `explain_route` concept: why did this task get routed
+        the way it did? Every `route()` call already records its full
+        RoutingDecision (scores + rejected_options) via
+        `memory.record_routing_decision` — this just reads it back. A task can
+        have more than one recorded decision (e.g. an advisory `enqueue_task`
+        pass followed by a real `submit_task` pass); all are returned, oldest
+        first."""
+        decisions = self.memory.get_routing_decisions(task_id)
+        if not decisions:
+            return {"error": "no_routing_decision_recorded", "task_id": task_id}
+        return {"task_id": task_id, "decisions": decisions}
+
     def get_router_status(self) -> dict[str, Any]:
         status = self._local_status()
         budget_brief = None
@@ -815,6 +901,16 @@ class RouterService:
                 self.budget.pressure(now), self.budget.require_explicit,
             )
 
+    def _refresh_circuit_state(self) -> None:
+        if self.circuit_breaker is None:
+            return
+        now = time.time()
+        open_ids = {
+            cfg.provider_id for cfg in self.registry.all()
+            if self.circuit_breaker.is_open(cfg.provider_id, now)
+        }
+        self.engine.set_circuit_state(open_ids)
+
     def _route_with_budget_prompt(self, ctx: RoutingContext, status) -> RoutingDecision:
         """Route; if the only blocker is a missing budget, prompt the USER directly
         (via the authorizer) to set one and route once more — never delegating the
@@ -822,6 +918,7 @@ class RouterService:
         decision = None
         for attempt in range(2):
             self._refresh_budget_state()
+            self._refresh_circuit_state()
             decision = self.engine.route(ctx, status)
             if decision.selected_provider is not None:
                 return decision
@@ -870,17 +967,65 @@ class RouterService:
         out = []
         for cfg in self.registry.all():
             rem = self.quota.remaining(cfg)
-            out.append(
-                {
-                    "provider": cfg.provider_id,
-                    "type": cfg.type,
-                    "privacy": cfg.privacy,
-                    "health": self.registry.health(cfg.provider_id),
-                    "capabilities": list(cfg.capabilities),
-                    "quota_remaining": rem,
-                }
-            )
+            entry = {
+                "provider": cfg.provider_id,
+                "type": cfg.type,
+                "privacy": cfg.privacy,
+                "health": self.registry.health(cfg.provider_id),
+                "capabilities": list(cfg.capabilities),
+                "quota_remaining": rem,
+            }
+            # Circuit breaker state is a cloud-call resilience concept (native
+            # port of OmniRoute's resilience tooling) — only meaningful for
+            # cloud providers, which are the only ones the breaker tracks.
+            if cfg.type == "cloud" and self.circuit_breaker is not None:
+                entry["circuit"] = self.circuit_breaker.status(cfg.provider_id)
+            out.append(entry)
         return out
+
+    def get_provider_metrics(self, provider_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """OmniRoute's `get_provider_metrics` concept: latency percentiles
+        (p50/p95/p99, computed from raw evaluation samples — the existing
+        scorecards only have AVG), current circuit-breaker state, and
+        compression savings, per provider (or just `provider_id` if given)."""
+        provider_ids = (
+            [provider_id] if provider_id else [p.provider_id for p in self.registry.all()]
+        )
+        out = []
+        for pid in provider_ids:
+            latencies = self.memory.evaluation_latencies(pid)
+            if len(latencies) >= 2:
+                q = statistics.quantiles(latencies, n=100, method="inclusive")
+                p50, p95, p99 = q[49], q[94], q[98]
+            elif latencies:
+                p50 = p95 = p99 = latencies[0]
+            else:
+                p50 = p95 = p99 = None
+            entry = {
+                "provider": pid,
+                "samples": len(latencies),
+                "latency_ms": {"p50": p50, "p95": p95, "p99": p99},
+            }
+            if self.circuit_breaker is not None:
+                entry["circuit"] = self.circuit_breaker.status(pid)
+            if self.compressor is not None:
+                entry["compression"] = self.compressor.stats_for(pid)
+            out.append(entry)
+        return out
+
+    def get_compression_status(self) -> dict[str, Any]:
+        """OmniRoute's `compression_status` concept: current policy (from
+        `config/routing.yaml`'s `compression` section) + rolling chars-saved
+        stats per provider since process start. Read-only — compression is
+        policy-file-driven, like everything here except budget."""
+        if self.compressor is None:
+            return {"enabled": False, "providers": {}}
+        return {
+            "enabled": self.compressor.enabled,
+            "apply_to": list(self.compressor.apply_to),
+            "min_chars_to_compress": self.compressor.min_chars_to_compress,
+            "providers": self.compressor.stats_all(),
+        }
 
     def promote_task(self, task_id: str) -> dict[str, Any]:
         task = self.memory.get_task(task_id)
