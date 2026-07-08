@@ -215,3 +215,32 @@ providers:
   #     reset: rolling
   #     window_seconds: 3600
   #     max_requests: 1000                     # a safety valve; OmniRoute meters below
+
+  # Free/low-cost aggregator — wide model selection, used as an overflow/fallback
+  # pool when the primary free-tier providers above are exhausted.
+  openrouter_free:
+    type: cloud
+    endpoint: "https://openrouter.ai/api/v1"
+    secret_ref: "op://AI/openrouter/api-key"
+    privacy: external
+    capabilities: [reasoning, coding, summarization, classification, review]
+    quota:
+      kind: free_or_low_cost
+      reset: daily
+      max_daily_requests: 50
+      max_daily_tokens: 500000
+
+  # Cheap paid tier (Grok models) — low per-token cost makes it a reasonable
+  # fallback once free-tier quota is exhausted, ahead of openai_paid.
+  xai_free:
+    type: cloud
+    endpoint: "https://api.x.ai/v1"
+    secret_ref: "op://AI/xai/api-key"
+    privacy: external
+    capabilities: [reasoning, coding, summarization, classification]
+    quota:
+      kind: paid
+      max_daily_spend_usd: 5.00
+      # $ per 1K tokens, used for spend estimation / budget enforcement.
+      price_per_1k_input_usd: 0.0002
+      price_per_1k_output_usd: 0.0005
