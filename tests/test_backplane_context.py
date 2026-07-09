@@ -38,8 +38,8 @@ def wikibrain_transport(items=None, pending=None, promoted=None):
     def transport(method, url, payload):
         if url.endswith("/recall"):
             return {"items": items if items is not None else [
-                {"text": PROMOTED_TEXT, "status": "promoted", "confidence": "verified",
-                 "source_id": "claim_004"},
+                {"text": PROMOTED_TEXT, "status": "promoted", "trusted": True, "confidence": "verified",
+                 "source_id": "claim_004", "trusted": True},
             ]}
         if url.endswith("/capture"):
             state["captured"].append(payload)
@@ -168,8 +168,8 @@ def test_wikibrain_promoted_claim_appears_in_manager_brief_as_trusted(task_svc):
 
 def test_wikibrain_pending_claim_is_excluded_by_default(tmp_path):
     wb = wikibrain_transport(items=[
-        {"text": PROMOTED_TEXT, "status": "promoted", "confidence": "verified",
-         "source_id": "claim_004"},
+        {"text": PROMOTED_TEXT, "status": "promoted", "trusted": True, "confidence": "verified",
+         "source_id": "claim_004", "trusted": True},
         {"text": "Qwen is weak at auth review.", "status": "pending", "confidence": "low",
          "source_id": "candidate_7"},
     ])

@@ -28,6 +28,7 @@ from agentconnect.core import (
     EchoWorker,
     GraphitiMemoryAdapter,
     MemoryConfig,
+    MemoryRanker,
     RecordAttemptRequest,
     RecordDecisionRequest,
     ReviewRequest,
@@ -37,29 +38,45 @@ from agentconnect.core import (
     TaskStatus,
     WikiBrainMemoryAdapter,
 )
-from agentconnect.core.memory import CaptureRequest
+from agentconnect.core.memory import CaptureRequest, MemoryItem
 
 # --------------------------------------------------------------------- fixtures
+
+#: WikiBrain always sends `trusted` — it is the authority's verdict, and the ONLY
+#: authority signal. `status: "promoted"` is not: a promoted claim in an open
+#: contradiction is promoted and untrusted at the same time. A fixture that omits
+#: `trusted` is simulating an untrusted claim, which is what these fixtures mean.
 
 #: A promoted, human-verified claim. This is the only kind of fact that is *true*.
 PROMOTED = {
     "text": "Refresh token validation lives in auth/session.py.",
     "status": "promoted", "confidence": "verified", "source_id": "claim_004",
+    "trusted": True,
 }
 #: A promoted-but-unverified claim. Trusted, but ranked under the verified one.
 PROMOTED_WEAK = {
     "text": "The auth module has no test coverage for expiry edges.",
     "status": "promoted", "confidence": "medium", "source_id": "claim_007",
+    "trusted": True,
 }
 #: An agent's suggestion. Nobody has blessed it.
 PENDING = {
     "text": "Validation should move to middleware.",
     "status": "pending", "confidence": "low", "source_id": "candidate_9",
+    "trusted": False,
 }
 #: A claim a human has since replaced.
 SUPERSEDED = {
     "text": "Validation lives in middleware.", "status": "superseded",
     "confidence": "high", "source_id": "claim_001", "superseded_by": "claim_004",
+    "trusted": False,
+}
+#: Promoted, of record, and party to an open contradiction. WikiBrain says so by
+#: sending `trusted: false` while leaving `status: "promoted"`.
+DISPUTED = {
+    "text": "Refresh token rotation happens on every request.",
+    "status": "promoted", "trusted": True, "confidence": "verified", "source_id": "claim_006",
+    "trusted": False, "contradiction_status": "open",
 }
 
 HARD_POLICIES = [
@@ -350,6 +367,46 @@ def test_a_backend_claiming_it_promoted_on_capture_is_downgraded(tmp_path):
     )
     result = svc.capture_memory_candidate(CaptureRequest(text="trust me"))
     assert result.status == "pending"
+
+
+def test_a_promoted_but_disputed_claim_is_never_handed_over_as_truth(tmp_path):
+    """The case where `status` and `trusted` disagree. Only `trusted` is authority."""
+    svc, _ = build(tmp_path, wikibrain_items=[PROMOTED, DISPUTED])
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+
+    pack = svc.get_task_context_pack(task.id)
+    assert DISPUTED["text"] not in texts(pack)      # withheld from a trusted_only pack
+    assert PROMOTED["text"] in texts(pack)          # its undisputed neighbour survives
+    assert any("disputed" in w or "withheld" in w for w in pack.warnings)
+
+
+def test_a_disputed_claim_never_outranks_an_undisputed_one(tmp_path):
+    """When it is admitted at all, it falls to the bottom of the authority ladder."""
+    from agentconnect.core.memory import label
+
+    ranker = MemoryRanker()
+    trusted = label(MemoryItem(text="a", status="promoted", confidence="verified",
+                               source_id="claim_1"), "wikibrain", "trusted_authority",
+                    authority_trusted=True)
+    disputed = label(MemoryItem(text="b", status="promoted", confidence="verified",
+                                source_id="claim_2"), "wikibrain", "trusted_authority",
+                     authority_trusted=False)
+    broad = label(MemoryItem(text="c", status="unknown", confidence="unknown",
+                             source_id="doc_1"), "cognee", "broad_retrieval")
+
+    assert ranker.authority(disputed) > ranker.authority(trusted)
+    assert ranker.authority(disputed) > ranker.authority(broad)
+    assert disputed.metadata["trusted"] is False
+
+
+def test_a_retrieval_engine_cannot_grant_itself_authority(tmp_path):
+    """Cognee returning `trusted: true` buys nothing: its role is not authoritative."""
+    from agentconnect.core.memory import label
+
+    forged = label(MemoryItem(text=POISON, status="promoted", confidence="verified",
+                              source_id="doc_evil"), "cognee", "broad_retrieval",
+                   authority_trusted=True)
+    assert forged.metadata["trusted"] is False
 
 
 def test_trusted_only_is_never_pushed_down_to_a_retrieval_engine(tmp_path):

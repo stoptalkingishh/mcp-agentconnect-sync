@@ -309,8 +309,9 @@ def test_workflow_recalls_context_through_the_activity_and_pushes_it_to_the_work
 
     def transport(method, url, payload):
         seen.append(url)
-        return {"items": [{"text": "Token expiry lives in session.py.", "status": "promoted",
-                           "confidence": "verified", "source_id": "claim_004"}]}
+        return {"items": [{"text": "Token expiry lives in session.py.", "status": "promoted", "trusted": True,
+                           "confidence": "verified", "source_id": "claim_004",
+                           "trusted": True}]}
 
     svc = _memory_service(tmp_path, transport)
     task = svc.create_task(CreateTaskRequest(title="t", goal="dedupe expiry"))
@@ -367,8 +368,9 @@ def test_recall_context_activity_builds_a_real_pack(tmp_path):
     from agentconnect.temporal.activities import BackplaneActivities
 
     def transport(method, url, payload):
-        return {"items": [{"text": "a promoted claim", "status": "promoted",
-                           "confidence": "high", "source_id": "claim_1"}]}
+        return {"items": [{"text": "a promoted claim", "status": "promoted", "trusted": True,
+                           "confidence": "high", "source_id": "claim_1",
+                           "trusted": True}]}
 
     svc = _memory_service(tmp_path, transport)
     task = svc.create_task(CreateTaskRequest(title="t", goal="g"))

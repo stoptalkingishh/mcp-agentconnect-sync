@@ -60,17 +60,74 @@ TRUSTED_STATUSES: frozenset[str] = frozenset({"promoted"})
 DEFAULT_MAX_ITEMS = 8
 
 
-def label(item: "MemoryItem", backend: str, role: MemoryRole) -> "MemoryItem":
+def label(
+    item: "MemoryItem", backend: str, role: MemoryRole,
+    authority_trusted: Optional[bool] = None,
+) -> "MemoryItem":
     """Stamp provenance onto an item so nothing downstream has to guess.
 
     Every consumer — the ranker, the MCP response, a human reading Linear — can
     then tell a promoted claim apart from a semantic search hit.
+
+    `status == "promoted"` is NOT sufficient authority. The trusted authority may
+    return a claim that is promoted and still not trustworthy — WikiBrain does
+    exactly this for a claim in an open contradiction, because a contradiction is
+    a warning, not a deletion, and the claim remains of record. When the authority
+    supplies its own verdict, pass it as `authority_trusted`.
+
+    The verdict may only ever **downgrade**:
+
+      * a retrieval engine claiming `trusted: true` cannot grant itself authority
+        (its role is not authoritative, so the conjunction is still False), and
+      * a promoted-but-disputed claim is not trusted however its status reads.
+
+    Stored under `authority_trusted` so re-labelling is idempotent: `ContextBuilder`
+    re-labels every item it receives, and must not be able to resurrect trust the
+    authority already withheld.
     """
-    item.metadata = dict(item.metadata or {})
-    item.metadata["backend"] = backend
-    item.metadata["role"] = role
-    item.metadata["trusted"] = role in (LEDGER, TRUSTED_AUTHORITY) and item.status == "promoted"
+    md = dict(item.metadata or {})
+    if authority_trusted is not None:
+        md["authority_trusted"] = bool(authority_trusted)
+    md["backend"] = backend
+    md["role"] = role
+    trusted = role in (LEDGER, TRUSTED_AUTHORITY) and item.status == "promoted"
+    verdict = md.get("authority_trusted")
+    if verdict is not None:
+        trusted = trusted and bool(verdict)
+    md["trusted"] = trusted
+    item.metadata = md
     return item
+
+
+def is_disputed(item: "MemoryItem") -> bool:
+    """A promoted claim the authority explicitly flagged as contradicted.
+
+    Distinct from `is_untrusted_authority_claim`: this one the authority *told* us
+    about, so we may say "disputed" out loud. A claim that merely arrived without a
+    `trusted` field is unknown, not disputed, and calling it contradicted would be
+    inventing a fact.
+    """
+    md = item.metadata or {}
+    return (
+        md.get("role") in (LEDGER, TRUSTED_AUTHORITY)
+        and item.status == "promoted"
+        and md.get("contradiction_status") == "open"
+    )
+
+
+def is_untrusted_authority_claim(item: "MemoryItem") -> bool:
+    """A `promoted` claim from the authority that the authority did not trust.
+
+    Covers both the disputed case and the dangerous silent one: a response with no
+    `trusted` field at all. Absence is treated as untrusted — never inferred from
+    `status`, which is the whole point of the boundary.
+    """
+    md = item.metadata or {}
+    return (
+        md.get("role") in (LEDGER, TRUSTED_AUTHORITY)
+        and item.status == "promoted"
+        and not md.get("trusted", False)
+    )
 
 
 @dataclass
@@ -105,6 +162,10 @@ class MemoryItem:
     valid_until: Optional[str] = None
     superseded_by: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: The authority's id for this item (e.g. WikiBrain `claim_4`). Feedback and
+    #: supersession both need to name a claim; without it a manager can report
+    #: "this was stale" about nothing in particular.
+    item_id: Optional[str] = None
 
 
 @dataclass
@@ -183,7 +244,9 @@ class TrustedMemoryAdapter(MemoryAdapter):
     role: MemoryRole = TRUSTED_AUTHORITY
 
     @abc.abstractmethod
-    def promote_candidate(self, candidate_id: str, promoted_by: str) -> dict[str, Any]: ...
+    def promote_candidate(self, candidate_id: str, promoted_by: str,
+                          confidence: Optional[str] = None,
+                          scope: Optional[str] = None) -> dict[str, Any]: ...
 
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
         return []
@@ -212,6 +275,13 @@ def apply_visibility(items: list[MemoryItem], request: RecallRequest) -> list[Me
             continue
         if status in ("rejected", "archived", "contradicted"):
             continue
+        if request.trusted_only and is_untrusted_authority_claim(item):
+            # Promoted, but the authority withheld trust — an open contradiction,
+            # or a response that never said `trusted` at all. `status` says
+            # promoted; only `trusted` is authority. Never silently upgraded.
+            # Scoped to `promoted` so the explicit pending/superseded overrides
+            # below still work.
+            continue
         if request.trusted_only and status not in TRUSTED_STATUSES:
             # `include_pending` and `include_superseded` are explicit, per-status
             # overrides of trusted_only. Without the superseded override the
@@ -226,6 +296,29 @@ def apply_visibility(items: list[MemoryItem], request: RecallRequest) -> list[Me
                 continue
         kept.append(item)
     return kept[: max(0, request.max_items)]
+
+
+def label_disputed(items: list[MemoryItem], dropped_disputed: int = 0,
+                   dropped_untrusted: int = 0) -> list[str]:
+    """Warnings for claims the authority promoted but declined to trust."""
+    out: list[str] = []
+    if dropped_disputed:
+        out.append(
+            f"{dropped_disputed} promoted claim(s) withheld: the trusted authority "
+            "marked them DISPUTED (open contradiction)"
+        )
+    if dropped_untrusted:
+        out.append(
+            f"{dropped_untrusted} promoted claim(s) withheld: the trusted authority "
+            "did not mark them trusted"
+        )
+    shown = sum(1 for i in items if is_disputed(i))
+    if shown:
+        out.append(
+            f"{shown} promoted claim(s) are DISPUTED (open contradiction) and are "
+            "NOT trusted — do not treat them as established guidance"
+        )
+    return out
 
 
 def label_pending(items: list[MemoryItem]) -> list[str]:
@@ -291,7 +384,24 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
         items = []
         for raw in body.get("items", []):
             scope = raw.get("scope") or {}
+            metadata = dict(raw.get("metadata") or {})
+            if raw.get("tags"):
+                metadata["tags"] = list(raw["tags"])
+            if raw.get("sources"):
+                metadata["sources"] = raw["sources"]
+            contradiction = raw.get("contradiction_status") or (
+                "open" if raw.get("contradicted") else None)
+            if contradiction:
+                metadata["contradiction_status"] = contradiction
+            if raw.get("validity"):
+                metadata["validity"] = raw["validity"]
+            # THE trust boundary. `trusted` is the authority's verdict and the only
+            # authority signal; `status` is not. A missing `trusted` means UNTRUSTED
+            # — never inferred from `status == "promoted"`, because a promoted claim
+            # in an open contradiction is exactly the case where the two disagree.
+            authority_trusted = bool(raw.get("trusted", False))
             items.append(label(MemoryItem(
+                item_id=raw.get("id"),
                 text=str(raw.get("text", "")),
                 status=raw.get("status", "unknown"),
                 confidence=raw.get("confidence", "unknown"),
@@ -299,13 +409,20 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
                 superseded_by=raw.get("superseded_by"),
                 valid_from=raw.get("valid_from"), valid_until=raw.get("valid_until"),
                 scope=MemoryScope(scope["scope_type"], scope["scope_id"]) if scope else None,
-                metadata=raw.get("metadata") or {},
-            ), self.backend_name, self.role))
+                metadata=metadata,
+            ), self.backend_name, self.role, authority_trusted=authority_trusted))
         visible = apply_visibility(items, request)
+        kept = {id(i) for i in visible}
+        dropped = [i for i in items if id(i) not in kept
+                   and is_untrusted_authority_claim(i)]
+        n_disputed = sum(1 for i in dropped if is_disputed(i))
         return RecallPack(
             profile=request.profile, query=request.query, items=visible,
             backend=self.backend_name,
-            warnings=list(body.get("warnings", [])) + label_pending(visible),
+            warnings=(list(body.get("warnings", []))
+                      + label_pending(visible)
+                      + label_disputed(visible, dropped_disputed=n_disputed,
+                                       dropped_untrusted=len(dropped) - n_disputed)),
         )
 
     def capture_candidate(self, request: CaptureRequest) -> CaptureResult:
@@ -326,9 +443,24 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
             status=status, message=body.get("message"), backend=self.backend_name,
         )
 
-    def promote_candidate(self, candidate_id: str, promoted_by: str) -> dict[str, Any]:
-        body = self._call("POST", f"/candidates/{candidate_id}/promote",
-                          {"promoted_by": promoted_by})
+    def promote_candidate(
+        self, candidate_id: str, promoted_by: str,
+        confidence: Optional[str] = None, scope: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Promote a pending candidate. Human/librarian only.
+
+        `confidence` and `scope` are the authority's, not ours, and it will refuse
+        to guess either: confidence is what the profile filters compare against
+        (`implementation_constraints` requires `high`), and a guessed scope is how a
+        repo-local fact leaks into global recall. We forward them and let WikiBrain
+        raise if they are missing and cannot be inherited.
+        """
+        payload: dict[str, Any] = {"promoted_by": promoted_by}
+        if confidence is not None:
+            payload["confidence"] = confidence
+        if scope is not None:
+            payload["scope"] = scope
+        body = self._call("POST", f"/candidates/{candidate_id}/promote", payload)
         body.setdefault("claim_id", candidate_id)
         body.setdefault("status", "promoted")
         return body
@@ -349,8 +481,21 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
             body = self._call("GET", "/health")
         except Exception as exc:
             return {"backend": self.backend_name, "status": "unreachable", "detail": str(exc)}
-        body.setdefault("backend", self.backend_name)
-        return body
+        # `backend` means different things on each side: to us it names the adapter,
+        # to WikiBrain it names its *retrieval* backend (sqlite_fts, graphiti, …).
+        # Map rather than `setdefault`, which would silently keep WikiBrain's value
+        # and make this adapter report itself as "sqlite_fts".
+        ok = bool(body.get("ok", True))
+        return {
+            "backend": self.backend_name,
+            "status": "ok" if ok else "degraded",
+            "ok": ok,
+            "role": self.role,
+            "retrieval": body.get("backend"),
+            "ledger": body.get("ledger", {}),
+            "profiles": body.get("profiles", []),
+            "schema_version": body.get("schema_version"),
+        }
 
 
 class CogneeMemoryAdapter(IndexingMemoryAdapter):

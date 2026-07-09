@@ -209,6 +209,11 @@ class MemoryRanker:
         if item.status == "pending":
             return self.PENDING_OR_UNKNOWN
         if role == TRUSTED_AUTHORITY and item.status == "promoted":
+            # `promoted` is not authority; `trusted` is. A claim the authority
+            # promoted but declined to trust (an open contradiction) must not rank
+            # above a search hit, let alone above an undisputed claim.
+            if not (item.metadata or {}).get("trusted", False):
+                return self.PENDING_OR_UNKNOWN
             return (
                 self.WIKIBRAIN_VERIFIED if item.confidence == "verified"
                 else self.WIKIBRAIN_PROMOTED
