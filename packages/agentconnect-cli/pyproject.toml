@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentconnect-cli"
+version = "0.1.0"
+description = "CLI adapter for the AgentConnect task backplane."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["agentconnect-core==0.2.0"]
+
+[project.optional-dependencies]
+linear = ["agentconnect-linear==0.1.0"]
+
+[project.scripts]
+agentconnect = "agentconnect.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentconnect.cli*"]
+namespaces = true

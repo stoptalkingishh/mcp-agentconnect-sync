@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentconnect-api"
+version = "0.1.0"
+description = "HTTP adapter for the AgentConnect task backplane — FastAPI over AgentConnectService."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "agentconnect-core==0.2.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+# /linear/sync needs the Linear adapter; /linear/webhook does not.
+linear = ["agentconnect-linear==0.1.0"]
+
+[project.scripts]
+agentconnect-api = "agentconnect.api.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentconnect.api*"]
+namespaces = true

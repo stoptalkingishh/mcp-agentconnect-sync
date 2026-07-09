@@ -16,5 +16,5 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["agentconnect.common*"]
+include = ["agentconnect.common*", "agentconnect.core*"]
 namespaces = true
