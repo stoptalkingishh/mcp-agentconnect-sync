@@ -8,8 +8,8 @@ read before proposing work.
 
 | | |
 |---|---|
-| Commit | `origin/main` (see `git log -1`) |
-| Gate | `.venv/bin/python -m pytest -q` — 697 passing |
+| Checkpoint | **`28048ed`** on `origin/main` |
+| Gate | `.venv/bin/python -m pytest -q` — **697 passing** |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for WikiBrain, Cognee, Graphiti |
 | Temporal | optional; `agentconnect-core` installs and runs with no workflow server |

@@ -9,6 +9,30 @@ The rule the whole system exists to enforce:
 > Agents may think and work inside their own harness. But durable work must enter
 > AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
 
+## Scope — read this before you trust it
+
+**This is not a sandbox.** It is a compliance layer. It makes AgentConnect the normal
+path and makes bypasses visible; it does not contain a hostile process. Concretely:
+
+* **`AGENTCONNECT_DB_PATH` is forwarded into the agent's environment on purpose.**
+  Without it the agent's own `agentconnect` CLI opens `~/.agentconnect/agentconnect.db`
+  and writes to a second ledger nobody reads. Forwarding it is what makes the agent's
+  work land where the audit looks. It is a path, not a credential — it grants no cloud
+  spend, no model access, no backend write token. Backend credentials are **never**
+  forwarded.
+* **Managed-session CLI commands are restricted by `AGENTCONNECT_MODE`.** `launch` and
+  `shell` set it, so the CLI knows it is the agent rather than the operator, and refuses
+  `complete` and `memory promote`. A reviewer may still complete its own *review*.
+* **Direct SQLite, filesystem, and environment tampering are out of scope.** An agent
+  that unsets `AGENTCONNECT_MODE`, opens the ledger file with the `sqlite3` binary, or
+  edits an artifact on disk is stopped by nothing in this layer. Guarding against that
+  needs OS-level isolation — a container, a microVM, a separate user — which this
+  deliberately does not provide.
+
+What the layer *does* buy you: an agent cannot casually reach a credential that is not
+in its environment, cannot mistype a task id, cannot complete its own work with the
+command sitting right there, and cannot make the audit agree that undone work is done.
+
 ## Install
 
 `agentconnect-core` alone gives you the library, not the command. Install the CLI too:
