@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from agentconnect.core import sessions as sessions_mod
 from agentconnect.core.bootstrap import service_from_env
 from agentconnect.core.context import PROFILES
 from agentconnect.core.errors import AgentConnectError
@@ -33,6 +37,7 @@ from agentconnect.core.models import (
     PrivacyTier,
     RecordAttemptRequest,
     RecordDecisionRequest,
+    RepoMode,
     ReviewRequest,
     ReviewResultRequest,
     ReviewStatus,
@@ -296,6 +301,159 @@ def _cmd_tasks_context_pack(svc: AgentConnectService, a: argparse.Namespace) -> 
     })
 
 
+# ---------------------------------------------------- compliance: launch/shell
+def _cmd_launch(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Prepare a managed session (compliance §3.1). Prints the shell command."""
+    result = svc.launch_session(
+        manager_id=a.manager, task_id=a.task, review_id=a.review, claim=a.claim,
+        readonly=a.readonly, force_readonly=a.force_readonly,
+        repo_source=a.repo, repo_mode=a.repo_mode,
+        launch_command=" ".join(sys.argv[1:]),
+    )
+    if a.json:
+        _emit({
+            "session": result["session"].model_dump(mode="json"),
+            "workspace": result["workspace"].model_dump(mode="json"),
+            "claim_id": result["claim_id"], "files": result["files"],
+            "shell_command": result["shell_command"],
+            # The token is written to `.env.agentconnect` (0600) and never printed:
+            # a token in a terminal scrollback is a token in a log.
+            "token": "(written to .env.agentconnect)",
+        })
+        return
+    session, workspace = result["session"], result["workspace"]
+    print("Prepared AgentConnect session.")
+    if session.task_id:
+        print(f"Task: {session.task_id}")
+    if session.review_id:
+        print(f"Review: {session.review_id}")
+    print(f"Manager: {session.manager_id}")
+    print(f"Mode: {session.mode.value}")
+    print(f"Workspace: {workspace.path}")
+    print(f"Repo: {workspace.repo_path} ({workspace.repo_mode.value})")
+    print(f"Claim: {result['claim_id'] or '(none)'}")
+    print(f"Wrote: {', '.join(result['files'])}")
+    print("Run:")
+    print(f"  {result['shell_command']}")
+
+
+def _cmd_shell(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Run a command inside the managed workspace (compliance §3.2).
+
+    The agent inherits an allowlisted environment plus its session vars. Backend
+    credentials are not removed from the environment so much as never copied into
+    it — see `core.sessions.sanitize_env`.
+    """
+    session = svc.active_session_for(task_id=a.task, review_id=a.review)
+    if session is None:
+        raise AgentConnectError(
+            f"no prepared session for {a.review or a.task}; run `agentconnect launch` first"
+        )
+    workspace = svc.get_workspace(session.workspace_id) if session.workspace_id else None
+    if workspace is None:
+        raise AgentConnectError(f"session {session.id} has no workspace")
+
+    base = Path(workspace.path)
+    stored = sessions_mod.parse_env_file((base / ".env.agentconnect").read_text("utf-8"))
+    cwd = Path(workspace.repo_path) if workspace.repo_path else base
+    if not cwd.exists():
+        cwd = base
+
+    try:
+        env = sessions_mod.sanitize_env(dict(os.environ), stored, helper_bin=str(base / "bin"))
+    except ValueError as exc:
+        raise AgentConnectError(str(exc)) from None
+
+    if a.print_env:
+        _emit({"cwd": str(cwd), "env": {k: ("***" if "TOKEN" in k else v)
+                                        for k, v in sorted(env.items())}})
+        return
+
+    # argparse.REMAINDER hands back the `--` separator too.
+    argv = a.command[1:] if a.command and a.command[0] == "--" else list(a.command)
+    if not argv:
+        raise AgentConnectError("nothing to run: `agentconnect shell --task T -- <command>`")
+
+    svc.start_shell(session.id, " ".join(argv))
+    exit_code = 1
+    try:
+        exit_code = subprocess.run(argv, cwd=str(cwd), env=env, check=False).returncode
+    except FileNotFoundError:
+        print(f"error: {argv[0]}: not found", file=sys.stderr)
+    finally:
+        svc.end_shell(session.id, exit_code)
+
+    if a.audit and session.task_id:
+        report = svc.audit_task(session.task_id)
+        print("", file=sys.stderr)
+        print(report.render(), file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def _cmd_audit(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    report = svc.audit_review(a.review) if a.review else svc.audit_task(a.task_id)
+    if a.json:
+        _emit(report.to_dict())
+    else:
+        print(report.render())
+    if not report.passed:
+        raise SystemExit(EXIT_REFUSED)
+
+
+def _cmd_complete(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    if a.review:
+        result = svc.complete_review_audited(
+            a.review,
+            ReviewResultRequest(completed_by=a.by, summary=a.summary or "Reviewed.",
+                                content=_read_body(a.file, a.content)),
+            force=a.force,
+        )
+        _emit({"review": result["review"].model_dump(mode="json"),
+               "audit": result["audit"], "forced": result["forced"]})
+        return
+    _emit(svc.complete_task(a.task_id, completed_by=a.by, force=a.force))
+
+
+def _cmd_sessions_list(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.list_sessions(task_id=a.task, manager_id=a.manager, status=a.status,
+                            limit=a.limit))
+
+
+def _cmd_sessions_show(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.get_session(a.session_id))
+
+
+def _cmd_workspaces_list(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.list_workspaces(include_destroyed=a.all))
+
+
+def _cmd_workspaces_show(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.get_workspace(a.workspace_id))
+
+
+def _cmd_cleanup(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    if a.abandoned:
+        _emit({"abandoned_sessions": svc.abandon_stale_sessions(a.older_than)})
+        return
+    if not a.task_id:
+        raise AgentConnectError("cleanup needs a TASK_ID or --abandoned")
+    workspace = svc.workspace_for(task_id=a.task_id)
+    if workspace is None:
+        raise AgentConnectError(f"no live workspace for {a.task_id}")
+    svc.cleanup_workspace(workspace.id, actor=a.by)
+    removed = False
+    if a.remove_files:
+        # A git worktree must be unregistered, not just deleted, or `git worktree
+        # list` keeps a dangling entry forever.
+        source = (workspace.metadata or {}).get("repo_source")
+        if workspace.repo_mode is RepoMode.git_worktree and source:
+            subprocess.run(["git", "worktree", "remove", "--force", workspace.repo_path],
+                           cwd=source, capture_output=True, check=False)
+        shutil.rmtree(workspace.path, ignore_errors=True)
+        removed = True
+    _emit({"workspace_id": workspace.id, "destroyed": True, "files_removed": removed})
+
+
 def _cmd_linear_webhook_test(svc: AgentConnectService, a: argparse.Namespace) -> None:
     """Apply a saved webhook payload to the ledger. No network, no credentials."""
     from agentconnect.linear.webhooks import handle_webhook
@@ -311,6 +469,84 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local-first task backplane for interchangeable agent managers and workers.",
     )
     top = parser.add_subparsers(dest="group", required=True)
+
+    # ------------------------------------------------- compliance layer (§18)
+    p = top.add_parser(
+        "launch",
+        help="prepare a managed agent session: workspace, instructions, scoped token",
+    )
+    p.add_argument("manager", help="claude | codex | any manager id")
+    p.add_argument("--task")
+    p.add_argument("--review")
+    p.add_argument("--claim", action="store_true", help="claim the task/review")
+    p.add_argument("--readonly", action="store_true",
+                   help="context inspection only; no decisions, subtasks, or completion")
+    p.add_argument("--force-readonly", action="store_true",
+                   help="downgrade to readonly instead of failing when the claim is held")
+    p.add_argument("--repo", help="source repo to materialize a workspace from")
+    p.add_argument("--repo-mode", default="auto",
+                   choices=["auto", "git_worktree", "copy", "bind", "empty"])
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_cmd_launch)
+
+    p = top.add_parser("shell", help="run a command inside the managed workspace")
+    p.add_argument("--task")
+    p.add_argument("--review")
+    p.add_argument("--audit", action="store_true", help="audit the task on exit")
+    p.add_argument("--print-env", action="store_true",
+                   help="show the sanitized environment instead of running")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="the agent command, after `--`")
+    p.set_defaults(func=_cmd_shell)
+
+    p = top.add_parser("audit", help="can this task be completed?")
+    p.add_argument("task_id", nargs="?")
+    p.add_argument("--review")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_cmd_audit)
+
+    p = top.add_parser("complete", help="mark complete — only if the audit passes")
+    p.add_argument("task_id", nargs="?")
+    p.add_argument("--review")
+    p.add_argument("--by", default="human")
+    p.add_argument("--summary")
+    p.add_argument("--content")
+    p.add_argument("--file")
+    p.add_argument("--force", action="store_true",
+                   help="human override; the audit problems are recorded anyway")
+    p.set_defaults(func=_cmd_complete)
+
+    sessions = top.add_parser("sessions", help="managed agent sessions").add_subparsers(
+        dest="cmd", required=True)
+    p = sessions.add_parser("list")
+    p.add_argument("--task")
+    p.add_argument("--manager")
+    p.add_argument("--status")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=_cmd_sessions_list)
+
+    p = sessions.add_parser("show")
+    p.add_argument("session_id")
+    p.set_defaults(func=_cmd_sessions_show)
+
+    workspaces = top.add_parser("workspaces", help="task workspaces").add_subparsers(
+        dest="cmd", required=True)
+    p = workspaces.add_parser("list")
+    p.add_argument("--all", action="store_true", help="include destroyed workspaces")
+    p.set_defaults(func=_cmd_workspaces_list)
+
+    p = workspaces.add_parser("show")
+    p.add_argument("workspace_id")
+    p.set_defaults(func=_cmd_workspaces_show)
+
+    p = top.add_parser("cleanup", help="retire a workspace, or sweep abandoned sessions")
+    p.add_argument("task_id", nargs="?")
+    p.add_argument("--abandoned", action="store_true")
+    p.add_argument("--older-than", type=float, default=24 * 3600)
+    p.add_argument("--remove-files", action="store_true",
+                   help="also delete the directory and unregister the git worktree")
+    p.add_argument("--by", default="human")
+    p.set_defaults(func=_cmd_cleanup)
 
     # tasks
     tasks = top.add_parser("tasks", help="task ledger").add_subparsers(dest="cmd", required=True)

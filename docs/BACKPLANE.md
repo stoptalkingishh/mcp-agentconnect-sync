@@ -1,6 +1,6 @@
 # AgentConnect backplane — as built
 
-Status of the four handoff specs against the code, as of 2026-07-10.
+Status of the five handoff specs against the code, as of 2026-07-10.
 Read this before trusting a spec: **the specs say what we intend, this file says
 what exists.**
 
@@ -8,8 +8,9 @@ what exists.**
 * `docs/BACKPLANE_SPEC_TEMPORAL.md` — Temporal-first durable execution (amends the above)
 * `docs/BACKPLANE_SPEC_ADAPTERS.md` — memory adapter + external local-model-manager boundary
 * `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
+* `docs/BACKPLANE_SPEC_COMPLIANCE.md` — easiest useful Level 4: launch, shell, audit
 
-Gate: `.venv/bin/python -m pytest -q` → **527 passed** (147 of them backplane tests, all offline).
+Gate: `.venv/bin/python -m pytest -q` → **647 passed**, all offline.
 
 ## The one rule
 
@@ -31,6 +32,11 @@ And within memory:
 > breadth. Graphiti improves temporal reasoning. Temporal runs workflows.
 > Linear shows humans what matters.
 
+And for the agents themselves:
+
+> Agents may think and work inside their own harness. But durable work must enter
+> AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
+
 ## Packages
 
 | Package | What it is |
@@ -39,6 +45,7 @@ And within memory:
 | `agentconnect-api` | FastAPI adapter (`agentconnect-api`) |
 | `agentconnect-cli` | `agentconnect` CLI |
 | `agentconnect-mcp` | MCP adapter (`agentconnect-mcp`) — 13 manager tools + 4 memory tools |
+| — | compliance layer lives in `core.sessions`, `core.workspace`, `core.audit` |
 | `agentconnect-linear` | Push sync + webhook ingest |
 | `agentconnect-temporal` | Workflows, activities, `TemporalExecutionBackend`, `agentconnect-temporal-worker` |
 
@@ -117,6 +124,18 @@ rides on every pack.
 > Enforced by `ContextBuilder` (`is_authority and not include_pending`) and pinned
 > by `test_trusted_only_is_never_pushed_down_to_a_retrieval_engine`.
 
+> ### ⚠️ `status: "promoted"` is not authority. `trusted` is.
+>
+> WikiBrain returns a claim in an open contradiction as `status: "promoted",
+> trusted: false` — a contradiction is a warning, not a deletion, so the claim
+> stays of record. Anything keying on `status` will hand a disputed claim to a
+> manager as established truth. A missing `trusted` therefore means **untrusted**
+> and is never inferred from the status. The verdict may only ever *downgrade*: a
+> retrieval engine sending `trusted: true` cannot grant itself authority.
+>
+> Enforced by `memory.label(..., authority_trusted=...)` and `memory.is_disputed`;
+> pinned by `tests/test_wikibrain_integration.py` against a real WikiBrain ledger.
+
 Write path: agent → `capture_memory_candidate` → **pending** in WikiBrain →
 human/librarian `promote_memory_candidate` → promoted claim → fanned out to
 Cognee and Graphiti. Capture **never promotes** — a backend that claims it did is
@@ -154,6 +173,61 @@ simply off and context packs are task state only.
 explanation as `local_estimate`. An outage rejects the worker at the `healthy`
 gate; it never crashes the API or MCP.
 
+**Compliance layer (spec 5).** `agentconnect launch claude --task task_123 --claim`
+prepares a managed session: it verifies the task, materializes a workspace (a git
+worktree on `agentconnect/task_123/<slug>` where possible; otherwise bind, copy,
+or empty), claims the task, mints a scoped token, and writes `AGENTCONNECT.md`,
+`CLAUDE.md`/`CODEX.md`, `.env.agentconnect` (0600), `.mcp.json`, and
+`workspace.json`. Then `agentconnect shell --task task_123 -- claude` runs the
+agent in that workspace.
+
+This is a **compliance wrapper, not a hardened sandbox**. It makes AgentConnect
+the normal path and makes bypasses visible; it does not stop a hostile agent. The
+`--container` seam exists in `shell` and is deliberately unimplemented.
+
+*Environment.* Sanitization is an **allowlist** (`PATH HOME SHELL TERM LANG LC_ALL
+USER LOGNAME TMPDIR TZ` plus the `AGENTCONNECT_*` session vars), never a bare
+`env -i` — an empty environment breaks too many tools to be useful. Backend
+credentials are not removed so much as never copied in, because they were never on
+the list. The denylist polices the one explicit opt-in path
+(`AGENTCONNECT_SHELL_ALLOW_ENV`), where an operator could otherwise re-admit a
+credential by name; anything matching `*_API_KEY`, `*_SECRET`, `*_TOKEN` and
+friends is refused there with an error rather than quietly obeyed.
+
+*Credentials.* An agent gets exactly one: a short-lived `act_…` session token,
+scoped to its session, entity, and mode. Manager mode buys ten actions, reviewer
+mode six, readonly four. `promote_memory_candidate`, `temporal_signal`,
+`secrets_read`, `grant_approval`, and `complete_task` are in **no** mode's list,
+so the deny is structural rather than a special case. Only the token's SHA-256 is
+stored; the plaintext exists just long enough to write the env file. Ending the
+shell revokes it, so a leaked `.env.agentconnect` is inert.
+
+*Ids are inferred.* `AGENTCONNECT_TASK_ID` and `AGENTCONNECT_MANAGER_ID` are in the
+environment, and every MCP tool falls back to them. An agent that cannot mistype an
+id cannot record its work against the wrong task.
+
+*Audit is the teeth.* `agentconnect audit task_123` asks one question several ways:
+*you did something — where is it in the ledger?* It checks the workspace, the
+session, the claim, an attempt recorded during **this** session, changed files
+registered as artifacts (structurally via `metadata["files"]`, or named in an
+artifact summary), resolved subtasks, completed reviews, a decision behind any
+durable change, a fresh handoff, Linear agreement, and status consistency. Memory
+capture is *advisory* — it warns, it never blocks, because memory is optional.
+
+The audit **writes nothing**. That is load-bearing: `get_handoff_summary` persists
+the summary as a side effect, so auditing through it would repair the staleness it
+reports, and the first audit would fail where the second passed. An audit that
+changes what it measures is not an audit. `complete_task` therefore regenerates the
+handoff *first*, then audits.
+
+*Completion.* `complete` runs the audit, marks the ledger succeeded, and only then
+fires completion hooks — which is how Linear learns. A hook that raises is logged,
+not fatal: a tracker outage cannot undo a completion. `/agentconnect complete` in a
+Linear comment routes through the same audit, and moving the Linear issue to Done
+records an event and changes nothing. The issue body says so:
+`**Canonical status:** AgentConnect-managed`.
+
+
 ## What is not built
 
 * `TaskWorkflow`, `ManagerHandoffWorkflow`, `WorkerPipelineWorkflow` — the spec
@@ -163,6 +237,8 @@ gate; it never crashes the API or MCP.
 * Real worker adapters beyond echo/raw-model: LiteLLM, OpenAI-compatible,
   Deep Agents, OpenClaw, sandboxed shell. `RawModelWorker` takes any
   `(prompt) -> text` callable, so these are adapters, not surgery.
+* Container/microVM isolation for `agentconnect shell` (spec 5 §16 — the `--container`
+  seam is designed for, and deliberately not built; host shell only).
 * Mem0 / Supermemory adapters (spec 4 §15 — explicitly not in the core stack yet).
 * Soft user-preference memory (spec 4 §3 — deliberately excluded).
 * Contradiction *detection* between promoted claims. `memory_comment("conflict", ...)`
@@ -204,6 +280,12 @@ Environment: `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`,
 # Memory is opt-in. With no config file and no *_URL set, packs are task state only.
 agentconnect memory pending                 # the librarian's queue
 agentconnect memory promote candidate_1 --by matthew   # human-only; not an MCP tool
+
+# Run a proprietary agent through the backplane:
+agentconnect launch claude --task task_123 --claim --repo ~/code/myrepo
+agentconnect shell --task task_123 -- claude
+agentconnect audit task_123
+agentconnect complete task_123 --by matthew   # refuses unless the audit passes
 ```
 
 The API server and the MCP server *start* workflows; the Temporal worker

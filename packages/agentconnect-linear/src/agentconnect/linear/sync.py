@@ -132,6 +132,22 @@ class LinearSync:
         """Compact memory notice: captured / promoted / conflict. Never a dump."""
         return self._comment(task_id, mapping.memory_comment(kind, **detail))
 
+    def post_completion(self, task_id: str, completed_by: str = "agentconnect") -> bool:
+        """Called by `service.complete_task` through a completion hook, never before
+        the ledger says succeeded (compliance §13)."""
+        self.sync_task(task_id)
+        return self._comment(task_id, mapping.completion_comment(task_id, completed_by))
+
+    def post_audit(self, task_id: str, report: object) -> bool:
+        return self._comment(task_id, mapping.audit_comment(report))
+
+    def completion_hook(self):
+        """Register with `service.bind_completion_hook(sync.completion_hook())`."""
+        def on_completed(task_id: str) -> None:
+            self.post_completion(task_id)
+        on_completed.__name__ = "linear_post_completion"
+        return on_completed
+
     def post_approval_request(self, subtask_id: str) -> bool:
         """§15 steps 4-5. Also re-syncs the issue so the `needs-approval` label lands."""
         subtask = self.service.get_subtask(subtask_id).subtask

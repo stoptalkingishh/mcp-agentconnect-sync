@@ -5,6 +5,7 @@ CLI, Linear) call :class:`AgentConnectService` and nothing below it.
 """
 
 from .artifacts import FilesystemArtifactStore, default_artifact_dir
+from .audit import AuditReport, Check, audit_review, audit_task
 from .errors import AgentConnectError, Conflict, InvalidRequest, NotFound, PolicyViolation
 from .execution import (
     DirectExecutionBackend,
@@ -50,6 +51,25 @@ from .memory import (
     TrustedMemoryAdapter,
     WikiBrainMemoryAdapter,
 )
+from .sessions import (
+    ACTIONS_BY_MODE,
+    FORBIDDEN_ACTIONS,
+    MANAGER_ACTIONS,
+    READONLY_ACTIONS,
+    REVIEWER_ACTIONS,
+    SECRET_DENYLIST,
+    actions_for,
+    sanitize_env,
+    session_env_vars,
+)
+from .workspace import (
+    DENIED_MCP_TOOLS,
+    EXPOSED_MCP_TOOLS,
+    WorkspaceBuilder,
+    changed_files,
+    mcp_config,
+    mode_for,
+)
 from .models import (
     ActorType,
     ApprovalRecord,
@@ -71,6 +91,7 @@ from .models import (
     HandoffSummary,
     InboxItem,
     InboxKind,
+    ManagerSession,
     Priority,
     PrivacyTier,
     RecordAttemptRequest,
@@ -79,8 +100,12 @@ from .models import (
     ReviewRequest,
     ReviewResultRequest,
     ReviewStatus,
+    RepoMode,
     RunStatus,
     SandboxSpec,
+    SessionMode,
+    SessionStatus,
+    SessionToken,
     Subtask,
     SubtaskDetail,
     SubtaskRequest,
@@ -92,6 +117,7 @@ from .models import (
     TaskSummary,
     WorkerLocation,
     WorkerRun,
+    Workspace,
 )
 from .routing import RouteExplanation, RoutePolicy, WorkerRegistry, route
 from .service import AgentConnectService, TaskContextPack
@@ -108,25 +134,50 @@ from .workers import (
 )
 
 __all__ = [
+    "ACTIONS_BY_MODE",
     "AgentConnectError", "AgentConnectService", "ActorType", "ApprovalRecord", "ApprovalStatus",
     "Artifact", "ArtifactChunk", "ArtifactSummary", "ArtifactType", "Attempt", "CaptureRequest",
+    "AuditReport",
     "CaptureResult", "Claim", "CogneeMemoryAdapter", "ContextBuilder", "ContextPack", "ClaimRole", "Conflict", "Constraint", "CreateArtifactRequest",
+    "Check",
     "CreateTaskRequest", "Decision", "DirectExecutionBackend", "EchoWorker", "Event",
+    "DENIED_MCP_TOOLS",
+    "EXPOSED_MCP_TOOLS",
     "ExecutionBackend", "ExecutionHandle", "ExecutionState", "ExecutionStatus", "ExternalRef",
+    "FORBIDDEN_ACTIONS",
     "FilesystemAccess", "FilesystemArtifactStore", "GraphitiMemoryAdapter", "HandoffSummary",
     "HttpLocalComputeProvider", "IndexingMemoryAdapter",
     "HttpMemoryAdapter", "InboxItem", "InboxKind", "InvalidRequest", "LocalComputeProvider",
     "LocalEstimate", "LocalEstimateRequest", "LocalModel", "LocalModelManagerWorkerAdapter",
     "LocalRunRequest", "LocalRunResult", "MemoryAdapter", "MemoryFeedbackRequest", "MemoryItem",
+    "MANAGER_ACTIONS",
+    "ManagerSession",
     "MemoryConfig", "MemoryRanker", "MemoryRouter", "MemoryScope", "NoopMemoryAdapter", "PROFILES",
     "ProfileConfig", "NotFound", "PolicyViolation", "Priority", "PrivacyTier",
+    "READONLY_ACTIONS",
+    "REVIEWER_ACTIONS",
     "RawModelWorker", "RecallPack", "RecallRequest", "RecordAttemptRequest",
     "RecordDecisionRequest", "Review", "ReviewRequest", "ReviewResultRequest", "ReviewStatus",
+    "RepoMode",
     "RouteExplanation", "RoutePolicy", "RunStatus", "SandboxSpec", "SqliteStorage",
+    "SECRET_DENYLIST",
+    "SessionMode",
+    "SessionStatus",
+    "SessionToken",
     "StaticMemoryAdapter", "Subtask", "SubtaskDetail", "SubtaskRequest", "SubtaskStatus", "Task",
     "TaskContextPack", "TaskDetail", "TaskFilters", "TaskStatus", "TaskSummary", "WorkerAdapter",
-    "WorkerCapabilities", "WorkerContext", "WorkerEstimate", "WorkerHealth", "WorkerLocation",
     "TrustedMemoryAdapter", "WikiBrainMemoryAdapter", "WorkerRegistry", "WorkerResult", "WorkerRun",
+    "WorkerCapabilities", "WorkerContext", "WorkerEstimate", "WorkerHealth", "WorkerLocation",
+    "Workspace",
+    "WorkspaceBuilder",
+    "actions_for",
+    "audit_review",
+    "audit_task",
+    "changed_files",
     "default_artifact_dir", "default_db_path",
+    "mcp_config",
+    "mode_for",
     "route",
+    "sanitize_env",
+    "session_env_vars",
 ]

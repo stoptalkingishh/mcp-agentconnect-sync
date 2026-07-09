@@ -257,7 +257,12 @@ class Artifact(BaseModel):
 
 
 class ArtifactSummary(BaseModel):
-    """What adapters return in lists: never a body. §13, §21."""
+    """What adapters return in lists: never a body. §13, §21.
+
+    ``metadata`` is not a body: it is how an artifact says which files it covers
+    (``{"files": ["auth/session.py"]}``), which is what the completion audit reads
+    to decide whether a change was ever registered.
+    """
 
     id: str
     task_id: str
@@ -266,6 +271,7 @@ class ArtifactSummary(BaseModel):
     size_bytes: int
     created_by: str
     created_at: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArtifactChunk(BaseModel):
@@ -370,6 +376,87 @@ class InboxItem(BaseModel):
     title: str = ""
     created_at: float = Field(default_factory=now)
     dismissed_at: Optional[float] = None
+
+
+class SessionMode(str, Enum):
+    """What a launched agent is *for*. Determines its token scope (compliance §9)."""
+
+    manager = "manager"
+    reviewer = "reviewer"
+    readonly = "readonly"
+
+
+class SessionStatus(str, Enum):
+    prepared = "prepared"
+    running = "running"
+    ended = "ended"
+    failed = "failed"
+    abandoned = "abandoned"
+
+
+class RepoMode(str, Enum):
+    git_worktree = "git_worktree"
+    copy = "copy"
+    bind = "bind"
+    empty = "empty"
+
+
+class Workspace(BaseModel):
+    """One directory per task or review: repo, artifacts, logs, instructions."""
+
+    id: str
+    task_id: Optional[str] = None
+    review_id: Optional[str] = None
+    path: str
+    repo_path: Optional[str] = None
+    artifact_path: Optional[str] = None
+    repo_mode: RepoMode = RepoMode.empty
+    created_at: float = Field(default_factory=now)
+    destroyed_at: Optional[float] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManagerSession(BaseModel):
+    """A launched, AgentConnect-managed run of a proprietary agent harness.
+
+    The session is what makes "did the agent record its work?" answerable: every
+    attempt, decision, and artifact is timestamped against ``started_at``.
+    """
+
+    id: str
+    task_id: Optional[str] = None
+    review_id: Optional[str] = None
+    manager_id: str
+    workspace_id: Optional[str] = None
+    mode: SessionMode = SessionMode.manager
+    status: SessionStatus = SessionStatus.prepared
+    claim_id: Optional[str] = None
+    started_at: float = Field(default_factory=now)
+    ended_at: Optional[float] = None
+    launch_command: str = ""
+    shell_command: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionToken(BaseModel):
+    """A scoped, expiring credential. Only the *hash* is ever stored.
+
+    ``plaintext`` is populated exactly once, at mint time, and is never persisted
+    or returned again — the same reason `/etc/shadow` holds no passwords.
+    """
+
+    id: str
+    session_id: str
+    scope: dict[str, Any] = Field(default_factory=dict)
+    expires_at: Optional[float] = None
+    revoked_at: Optional[float] = None
+    created_at: float = Field(default_factory=now)
+    plaintext: Optional[str] = Field(default=None, exclude=True)
+
+    def active_at(self, at: float) -> bool:
+        if self.revoked_at is not None:
+            return False
+        return self.expires_at is None or at < self.expires_at
 
 
 class Event(BaseModel):

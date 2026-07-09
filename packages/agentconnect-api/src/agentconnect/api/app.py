@@ -17,6 +17,7 @@ from agentconnect.core.service import AgentConnectService
 
 from . import (
     routes_artifacts,
+    routes_compliance,
     routes_linear,
     routes_managers,
     routes_memory,
@@ -60,6 +61,7 @@ def create_app(
     for module in (
         routes_tasks, routes_artifacts, routes_reviews, routes_managers,
         routes_subtasks, routes_linear, routes_memory, routes_temporal,
+        routes_compliance,
     ):
         app.include_router(module.router)
     return app

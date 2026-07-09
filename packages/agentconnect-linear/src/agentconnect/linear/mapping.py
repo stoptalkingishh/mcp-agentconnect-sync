@@ -12,7 +12,7 @@ Two rules govern everything here:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from agentconnect.core.models import (
     ArtifactSummary,
@@ -76,10 +76,18 @@ def issue_body(detail: TaskDetail, handoff_text: Optional[str] = None) -> str:
     """The §14.2 description block."""
     withheld = is_withheld(detail)
     task = detail.task
+    open_review = next(
+        (r for r in detail.reviews
+         if r.status.value in ("open", "claimed", "in_progress")), None,
+    )
     lines = [
         f"**AgentConnect Task:** `{task.id}`",
+        "**Canonical status:** AgentConnect-managed — "
+        "moving this issue does not change task state.",
         f"**Status:** {task.status.value}",
         f"**Current manager:** {task.current_manager or '(unclaimed)'}",
+        f"**Current review:** "
+        f"{f'`{open_review.id}` → {open_review.assigned_to}' if open_review else '(none)'}",
         f"**Privacy:** {detail.effective_privacy.value}",
         f"**Priority:** {task.priority.value}",
         "",
@@ -208,6 +216,30 @@ def memory_comment(kind: str, **detail: object) -> str:
             f"`{detail.get('a')}` and `{detail.get('b')}`."
         )
     return f"**Memory update:** {kind}"
+
+
+def audit_comment(report: Any) -> str:
+    """What `/agentconnect status` and a refused `/agentconnect complete` return.
+
+    A human in Linear should be able to see *why* the backplane refused, without
+    reading the ledger. The problems are the whole message.
+    """
+    if report.passed:
+        checks = "\n".join(f"- {c.detail}" for c in report.checks if c.passed and c.detail)
+        return f"**AgentConnect audit: PASS**\n\n{checks}"
+    problems = "\n".join(f"- {p}" for p in report.problems)
+    return (
+        f"**AgentConnect audit: FAIL**\n\n{problems}\n\n"
+        f"_Task cannot be marked complete. Linear status is a mirror; "
+        f"AgentConnect decides completion._"
+    )
+
+
+def completion_comment(task_id: str, completed_by: str) -> str:
+    return (
+        f"**Task completed** `{task_id}` by {completed_by}.\n\n"
+        f"_Audit passed. AgentConnect marked the task succeeded, then updated Linear._"
+    )
 
 
 def approval_request_comment(subtask: Subtask, explanation: RouteExplanation) -> str:

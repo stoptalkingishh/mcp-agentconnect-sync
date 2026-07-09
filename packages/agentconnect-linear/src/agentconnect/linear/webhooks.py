@@ -22,7 +22,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from agentconnect.core.models import InboxKind, SubtaskStatus
+from agentconnect.core.errors import Conflict, PolicyViolation
+from agentconnect.core.models import InboxKind, ReviewRequest, SubtaskStatus
 from agentconnect.core.service import AgentConnectService
 
 _log = logging.getLogger(__name__)
@@ -42,9 +43,14 @@ _TARGET_ALIASES = {
 _COMMAND_RE = re.compile(rf"^\s*{re.escape(COMMAND_PREFIX)}\s+(?P<rest>.+)$", re.MULTILINE)
 
 
+#: Commands a human may type in a Linear comment. `complete` is audit-gated:
+#: Linear asks, AgentConnect decides (compliance §13-§14).
+_ACTIONS = ("approve", "deny", "status", "complete", "request-review")
+
+
 @dataclass
 class ApprovalCommand:
-    action: str  # approve | deny
+    action: str  # approve | deny | status | complete | request-review
     target: Optional[str] = None  # normalized approval_location, or None = any
     params: dict[str, str] = field(default_factory=dict)
     raw: str = ""
@@ -89,7 +95,7 @@ def parse_command(text: str) -> Optional[ApprovalCommand]:
         return None
 
     action = tokens[0].lower()
-    if action not in ("approve", "deny"):
+    if action not in _ACTIONS:
         _log.info("unknown agentconnect command %r", action)
         return None
 
@@ -170,6 +176,9 @@ def _handle_comment(
         {"action": command.action, "target": command.target, "params": command.params},
     )
 
+    if command.action in ("status", "complete", "request-review"):
+        return [_handle_task_command(service, task, command, actor)]
+
     pending = _pending_subtasks(service, task.id, command.target)
     if not pending:
         return [{
@@ -193,6 +202,46 @@ def _handle_comment(
                 "status": updated.status.value, "reason": command.reason,
             })
     return results
+
+
+def _handle_task_command(
+    service: AgentConnectService, task: Any, command: ApprovalCommand, actor: str,
+) -> dict[str, Any]:
+    """`status`, `complete`, and `request-review` from a Linear comment (§14).
+
+    `complete` runs the audit first. A human typing "done" in a tracker does not
+    make work complete; the ledger does. On failure the problems come back so the
+    human sees exactly what was never recorded.
+    """
+    if command.action == "status":
+        report = service.audit_task(task.id)
+        return {"kind": "status", "task_id": task.id, "status": task.status.value,
+                "audit": "PASS" if report.passed else "FAIL",
+                "problems": report.problems}
+
+    if command.action == "request-review":
+        reviewer = command.target or command.params.get("reason") or ""
+        reviewer = reviewer.strip()
+        if not reviewer:
+            return {"kind": "review_no_assignee", "task_id": task.id,
+                    "reason": "usage: /agentconnect request-review <manager-id>"}
+        review = service.request_review(task.id, ReviewRequest(
+            requested_by=actor, assigned_to=reviewer,
+            criteria=[c.text for c in service.get_task(task.id).constraints],
+        ))
+        return {"kind": "review_requested", "task_id": task.id,
+                "review_id": review.id, "assigned_to": reviewer}
+
+    try:
+        result = service.complete_task(task.id, completed_by=actor)
+    except PolicyViolation as exc:
+        report = service.audit_task(task.id)
+        return {"kind": "completion_refused", "task_id": task.id,
+                "problems": report.problems, "reason": str(exc)}
+    except Conflict as exc:
+        return {"kind": "completion_refused", "task_id": task.id, "reason": str(exc)}
+    return {"kind": "completed", "task_id": task.id, "status": result["status"],
+            "audit": "PASS"}
 
 
 def _handle_issue_update(

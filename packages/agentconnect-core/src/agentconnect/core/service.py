@@ -16,12 +16,14 @@ from typing import Any, Callable, Optional
 
 from pydantic import BaseModel
 
+from . import audit as audit_mod
 from . import claims as claims_policy
 from . import decisions as decisions_policy
 from . import handoff as handoff_mod
 from . import ids
 from . import memory as memory_mod
 from . import reviews as reviews_policy
+from . import sessions as sessions_mod
 from . import subtasks as subtasks_policy
 from .context import ContextBuilder, ContextPack, MemoryConfig
 from .memory import (
@@ -37,8 +39,10 @@ from .memory import (
     TrustedMemoryAdapter,
 )
 from .artifacts import FilesystemArtifactStore
-from .errors import Conflict, InvalidRequest, NotFound
+from .audit import AuditReport
+from .errors import Conflict, InvalidRequest, NotFound, PolicyViolation
 from .execution import DirectExecutionBackend, ExecutionBackend, ExecutionHandle, ExecutionState
+from .workspace import WorkspaceBuilder, mode_for
 from .models import (
     ApprovalRecord,
     ApprovalStatus,
@@ -59,6 +63,7 @@ from .models import (
     HandoffSummary,
     InboxItem,
     InboxKind,
+    ManagerSession,
     PrivacyTier,
     RecordAttemptRequest,
     RecordDecisionRequest,
@@ -67,6 +72,9 @@ from .models import (
     ReviewResultRequest,
     ReviewStatus,
     RunStatus,
+    SessionMode,
+    SessionStatus,
+    SessionToken,
     Subtask,
     SubtaskDetail,
     SubtaskRequest,
@@ -78,6 +86,7 @@ from .models import (
     TaskSummary,
     TERMINAL_TASK_STATUSES,
     WorkerRun,
+    Workspace,
 )
 from .routing import RouteExplanation, RoutePolicy, WorkerRegistry, route
 from .storage import SqliteStorage, default_db_path
@@ -117,9 +126,17 @@ class AgentConnectService:
         memory: Optional[MemoryAdapter] = None,
         memory_backends: Optional[dict[str, MemoryAdapter]] = None,
         memory_config: Optional[MemoryConfig] = None,
+        workspace_dir: Optional[str] = None,
+        api_url: str = "http://localhost:8790",
     ) -> None:
         self.storage = storage
         self.artifacts = artifact_store
+        self.workspaces = WorkspaceBuilder(workspace_dir)
+        self.api_url = api_url
+        #: Called with a task id *after* the ledger marks it succeeded. Linear
+        #: registers here, which is what makes AgentConnect the upstream of the
+        #: tracker rather than the other way round (compliance §13).
+        self.completion_hooks: list[Callable[[str], None]] = []
         self.registry = registry or WorkerRegistry()
         self.policy = policy or RoutePolicy()
         self._clock = clock
@@ -147,6 +164,10 @@ class AgentConnectService:
 
     def bind_execution(self, backend: ExecutionBackend) -> None:
         self.execution = backend
+
+    def bind_completion_hook(self, hook: Callable[[str], None]) -> None:
+        """Run after a task is marked succeeded. Never before: the ledger decides."""
+        self.completion_hooks.append(hook)
 
     def bind_memory(self, adapter: MemoryAdapter) -> None:
         """Single-backend convenience. Prefer `bind_memory_stack` for the real stack."""
@@ -185,6 +206,8 @@ class AgentConnectService:
         memory: Optional[MemoryAdapter] = None,
         memory_backends: Optional[dict[str, MemoryAdapter]] = None,
         memory_config: Optional[MemoryConfig] = None,
+        workspace_dir: Optional[str] = None,
+        api_url: str = "http://localhost:8790",
     ) -> "AgentConnectService":
         return cls(
             storage=SqliteStorage(db_path or default_db_path()),
@@ -196,6 +219,8 @@ class AgentConnectService:
             memory=memory,
             memory_backends=memory_backends,
             memory_config=memory_config,
+            workspace_dir=workspace_dir,
+            api_url=api_url,
         )
 
     # ------------------------------------------------------------ internals
@@ -1137,7 +1162,10 @@ class AgentConnectService:
         self.storage.update_subtask(subtask_id, metadata=metadata, updated_at=self._now())
 
     # ------------------------------------------------------ memory promotion
-    def promote_memory_candidate(self, candidate_id: str, promoted_by: str) -> dict[str, Any]:
+    def promote_memory_candidate(
+        self, candidate_id: str, promoted_by: str,
+        confidence: Optional[str] = None, scope: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Human/librarian only (memory-stack §4). Never exposed as an MCP tool.
 
         Promotion is the single act that turns an agent's suggestion into a
@@ -1151,7 +1179,15 @@ class AgentConnectService:
                 f"no trusted memory authority configured "
                 f"(expected {self.memory_config.trusted_authority!r})"
             )
-        claim = authority.promote_candidate(candidate_id, promoted_by)
+        # Forwarded only when supplied, so a TrustedMemoryAdapter with the older
+        # two-argument signature still works. The authority decides whether it can
+        # promote without them; it must never guess.
+        extra: dict[str, Any] = {}
+        if confidence is not None:
+            extra["confidence"] = confidence
+        if scope is not None:
+            extra["scope"] = scope
+        claim = authority.promote_candidate(candidate_id, promoted_by, **extra)
         claim.setdefault("claim_id", candidate_id)
         indexed, failed = [], []
         for name, adapter in self.memory_backends.items():
@@ -1184,3 +1220,365 @@ class AgentConnectService:
         except Exception as exc:
             _log.warning("listing pending memory failed: %s", exc)
             return []
+
+    # ==================================================== compliance layer §3-§13
+    # `launch` prepares a managed session; `shell` (the CLI) runs the agent inside
+    # it; `audit` asks where the work was recorded; `complete` refuses until it was.
+
+    def _require_session(self, session_id: str) -> ManagerSession:
+        session = self.storage.get_session(session_id)
+        if session is None:
+            raise NotFound(f"unknown session {session_id!r}")
+        return session
+
+    def _require_workspace(self, workspace_id: str) -> Workspace:
+        workspace = self.storage.get_workspace(workspace_id)
+        if workspace is None:
+            raise NotFound(f"unknown workspace {workspace_id!r}")
+        return workspace
+
+    # ---------------------------------------------------------------- launch
+    def launch_session(
+        self,
+        manager_id: str,
+        task_id: Optional[str] = None,
+        review_id: Optional[str] = None,
+        claim: bool = False,
+        readonly: bool = False,
+        force_readonly: bool = False,
+        repo_source: Optional[str] = None,
+        repo_mode: str = "auto",
+        launch_command: str = "",
+        token_ttl_seconds: int = sessions_mod.DEFAULT_TOKEN_TTL_SECONDS,
+        api_url: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Prepare a managed AgentConnect session (§3.1).
+
+        Returns the session, the workspace, the files written, and the *plaintext*
+        token — the only time it exists. Everything else is durable.
+        """
+        if not task_id and not review_id:
+            raise InvalidRequest("launch needs either a task_id or a review_id")
+
+        review: Optional[Review] = None
+        if review_id:
+            review = self._require_review(review_id)
+            task_id = task_id or review.task_id
+        task = self._require_task(task_id)  # verify it exists before touching disk
+
+        mode = mode_for(review_id, readonly)
+        now = self._now()
+        entity_id = review_id or task_id
+
+        # 1. Claim before building anything on disk: a refused claim must not leave
+        #    a half-prepared workspace behind.
+        claim_id: Optional[str] = None
+        if claim and not readonly:
+            try:
+                if review_id:
+                    self.claim_review(review_id, manager_id)
+                    claim_id = review_id
+                else:
+                    claim_id = self.claim_task(task_id, manager_id).id
+            except Conflict:
+                if not force_readonly:
+                    raise
+                mode = SessionMode.readonly
+                _log.warning("claim refused for %s; downgrading to readonly", entity_id)
+
+        # 2. Workspace, instructions, config.
+        base, repo_path, artifact_path, resolved_mode = self.workspaces.build(
+            entity_id, task.title, manager_id, repo_source=repo_source, repo_mode=repo_mode,
+        )
+        workspace = Workspace(
+            id=ids.new_id(ids.WORKSPACE), task_id=task_id, review_id=review_id,
+            path=str(base), repo_path=str(repo_path), artifact_path=str(artifact_path),
+            repo_mode=resolved_mode, created_at=now,
+            metadata={"manager_id": manager_id, "repo_source": repo_source},
+        )
+        self.storage.insert_workspace(workspace)
+
+        session = ManagerSession(
+            id=ids.new_id(ids.SESSION), task_id=task_id, review_id=review_id,
+            manager_id=manager_id, workspace_id=workspace.id, mode=mode,
+            status=SessionStatus.prepared, claim_id=claim_id, started_at=now,
+            launch_command=launch_command,
+        )
+        self.storage.insert_session(session)
+
+        # 3. The one credential the agent gets. Scoped to this session, this
+        #    entity, and exactly the actions its mode allows.
+        token = self.mint_session_token(session, ttl_seconds=token_ttl_seconds)
+
+        resolved_api = api_url or self.api_url
+        env = sessions_mod.session_env_vars(
+            api_url=resolved_api, task_id=task_id, review_id=review_id,
+            manager_id=manager_id, workspace_id=workspace.id, session_id=session.id,
+            token=token.plaintext, mode=mode,
+        )
+        files = self.workspaces.write_instructions(base, manager_id)
+        self.workspaces.write_env_file(base, sessions_mod.render_env_file(env))
+        self.workspaces.write_mcp_config(base, resolved_api, env)
+        metadata = {
+            "workspace_id": workspace.id, "task_id": task_id, "review_id": review_id,
+            "manager_id": manager_id, "repo_source": repo_source,
+            "repo_mode": resolved_mode.value, "repo_path": str(repo_path),
+            "artifact_path": str(artifact_path), "created_at": now,
+            "session_id": session.id, "mode": mode.value,
+        }
+        self.workspaces.write_metadata(base, metadata)
+        files += [".env.agentconnect", ".mcp.json", "workspace.json"]
+
+        self.storage.update_session(session.id, workspace_id=workspace.id)
+        self.record_event(
+            task_id, "session_prepared", manager_id,
+            {"session_id": session.id, "workspace_id": workspace.id, "mode": mode.value,
+             "review_id": review_id, "claim_id": claim_id},
+        )
+        shell_flag = f"--review {review_id}" if review_id else f"--task {task_id}"
+        return {
+            "session": session.model_copy(update={"mode": mode}),
+            "workspace": workspace,
+            "claim_id": claim_id,
+            "token": token.plaintext,
+            "files": files,
+            "env": env,
+            "shell_command": f"agentconnect shell {shell_flag} -- {manager_id}",
+        }
+
+    # ----------------------------------------------------------------- shell
+    def start_shell(self, session_id: str, shell_command: str) -> ManagerSession:
+        session = self._require_session(session_id)
+        if session.status not in (SessionStatus.prepared, SessionStatus.running):
+            raise Conflict(f"session {session_id} is {session.status.value}")
+        self.storage.update_session(
+            session_id, status=SessionStatus.running.value, shell_command=shell_command
+        )
+        self.record_event(
+            session.task_id, "shell_started", session.manager_id,
+            {"session_id": session_id, "command": shell_command},
+        )
+        return self._require_session(session_id)
+
+    def end_shell(self, session_id: str, exit_code: int = 0) -> ManagerSession:
+        session = self._require_session(session_id)
+        now = self._now()
+        status = SessionStatus.ended if exit_code == 0 else SessionStatus.failed
+        self.storage.update_session(session_id, status=status.value, ended_at=now)
+        # The token dies with the shell. A leaked `.env.agentconnect` is then inert.
+        self.storage.revoke_tokens_for_session(session_id, now)
+        self.record_event(
+            session.task_id, "shell_ended", session.manager_id,
+            {"session_id": session_id, "exit_code": exit_code, "status": status.value},
+        )
+        return self._require_session(session_id)
+
+    def active_session_for(
+        self, task_id: Optional[str] = None, review_id: Optional[str] = None
+    ) -> Optional[ManagerSession]:
+        return self.storage.latest_session(
+            task_id=task_id, review_id=review_id,
+            statuses=(SessionStatus.prepared.value, SessionStatus.running.value),
+        )
+
+    def get_session(self, session_id: str) -> ManagerSession:
+        return self._require_session(session_id)
+
+    def list_sessions(
+        self, task_id: Optional[str] = None, manager_id: Optional[str] = None,
+        status: Optional[str] = None, limit: int = 50,
+    ) -> list[ManagerSession]:
+        return self.storage.list_sessions(task_id, manager_id, status, limit)
+
+    def get_workspace(self, workspace_id: str) -> Workspace:
+        return self._require_workspace(workspace_id)
+
+    def list_workspaces(self, include_destroyed: bool = False) -> list[Workspace]:
+        return self.storage.list_workspaces(include_destroyed)
+
+    def workspace_for(
+        self, task_id: Optional[str] = None, review_id: Optional[str] = None
+    ) -> Optional[Workspace]:
+        return self.storage.find_workspace(task_id=task_id, review_id=review_id)
+
+    # ---------------------------------------------------------------- tokens
+    def mint_session_token(
+        self, session: ManagerSession,
+        ttl_seconds: int = sessions_mod.DEFAULT_TOKEN_TTL_SECONDS,
+    ) -> SessionToken:
+        now = self._now()
+        plaintext = sessions_mod.mint_token()
+        token = SessionToken(
+            id=ids.new_id(ids.TOKEN), session_id=session.id,
+            scope=sessions_mod.build_scope(
+                session.id, session.manager_id, session.mode, session.task_id,
+                session.review_id,
+            ),
+            expires_at=now + max(1, ttl_seconds), created_at=now, plaintext=plaintext,
+        )
+        self.storage.insert_token(token, sessions_mod.hash_token(plaintext))
+        return token
+
+    def authorize(self, token: str, action: str) -> dict[str, Any]:
+        """Check a session token against one action. Raises, never returns False.
+
+        A token buys exactly the actions of its mode. `promote_memory_candidate`,
+        Temporal admin, and secret reads are in no mode's list, so no agent-held
+        token can ever reach them — the deny is structural, not a special case.
+        """
+        record = self.storage.get_token_by_hash(sessions_mod.hash_token(token or ""))
+        if record is None:
+            raise PolicyViolation("unknown session token")
+        if not record.active_at(self._now()):
+            reason = "revoked" if record.revoked_at else "expired"
+            raise PolicyViolation(f"session token is {reason}")
+        allowed = set(record.scope.get("actions", []))
+        if action in sessions_mod.FORBIDDEN_ACTIONS or action not in allowed:
+            raise PolicyViolation(
+                f"action {action!r} is not permitted for a "
+                f"{record.scope.get('mode')} session token"
+            )
+        return record.scope
+
+    def revoke_session_tokens(self, session_id: str) -> int:
+        return self.storage.revoke_tokens_for_session(session_id, self._now())
+
+    # ----------------------------------------------------------------- audit
+    def audit_task(self, task_id: str) -> AuditReport:
+        """§12. Reads the ledger and the worktree; **writes nothing.**
+
+        The read-only part is load-bearing. `get_handoff_summary` persists the
+        summary as a side effect, so auditing through it would repair the very
+        staleness it reports: the first audit would fail and the second would
+        pass. An audit that changes what it measures is not an audit.
+        """
+        detail = self.get_task(task_id)
+        workspace = self.workspace_for(task_id=task_id)
+        session = self.storage.latest_session(task_id=task_id)
+
+        stored = detail.task.handoff_summary
+        fresh = handoff_mod.build(
+            detail, None, self._now(),
+            running_workflows=self._running_workflows(detail),
+            waiting_approvals=[
+                a for a in self.storage.list_approvals(task_id)
+                if a.status is ApprovalStatus.pending
+            ],
+        )
+
+        linear_ref = self.get_external_ref("task", task_id, "linear")
+        linear_state = None
+        for event in self.storage.list_events(task_id, limit=200):
+            if event.kind == "linear_status_change":
+                linear_state = event.payload.get("state")
+                break  # events come back newest first
+
+        captured = any(
+            e.kind == "memory_candidate_captured"
+            for e in self.storage.list_events(task_id, limit=200)
+        )
+        return audit_mod.audit_task(
+            detail, workspace, session, fresh.text, stored,
+            linear_ref=linear_ref, linear_state=linear_state,
+            memory_captured=captured,
+            memory_enabled=self.memory_config.enabled and bool(self.memory_backends),
+        )
+
+    def audit_review(self, review_id: str) -> AuditReport:
+        review = self._require_review(review_id)
+        detail = self.get_task(review.task_id)
+        workspace = self.workspace_for(review_id=review_id)
+        session = self.storage.latest_session(review_id=review_id)
+        return audit_mod.audit_review(review, detail, workspace, session)
+
+    # -------------------------------------------------------------- complete
+    def complete_task(
+        self, task_id: str, completed_by: str, force: bool = False,
+    ) -> dict[str, Any]:
+        """§13. The audit runs first; Linear hears about it last.
+
+        A proprietary agent cannot shortcut this: `complete_task` is not an MCP
+        tool. `force` exists for a human operator with a good reason, and it is
+        recorded as such.
+        """
+        task = self._require_task(task_id)
+        if task.status is TaskStatus.succeeded:
+            raise Conflict(f"task {task_id} is already succeeded")
+
+        # Completing a task must leave a current handoff behind, so refresh it
+        # first and *then* audit. This also keeps `complete` from tripping on the
+        # `handoff_fresh` check for a manager who did everything else right.
+        self.regenerate_handoff_summary(task_id)
+        report = self.audit_task(task_id)
+        if not report.passed and not force:
+            self.record_event(
+                task_id, "completion_refused", completed_by, {"problems": report.problems}
+            )
+            raise PolicyViolation(
+                "audit failed; task cannot be marked complete:\n"
+                + "\n".join(f"- {p}" for p in report.problems)
+            )
+
+        self._touch(task_id, status=TaskStatus.succeeded.value)
+        self.record_event(
+            task_id, "task_completed", completed_by,
+            {"forced": force, "warnings": report.warnings,
+             "problems": report.problems if force else []},
+        )
+
+        # Only now does the tracker hear about it. Linear mirrors AgentConnect;
+        # it never decides completion (§13).
+        mirrored = []
+        for hook in self.completion_hooks:
+            try:
+                hook(task_id)
+                mirrored.append(getattr(hook, "__name__", "hook"))
+            except Exception as exc:  # a mirror outage is not a ledger failure
+                _log.warning("completion hook failed for %s: %s", task_id, exc)
+        return {
+            "task_id": task_id, "status": TaskStatus.succeeded.value,
+            "audit": report.to_dict(), "forced": force, "mirrored": mirrored,
+        }
+
+    def complete_review_audited(
+        self, review_id: str, request: ReviewResultRequest, force: bool = False,
+    ) -> dict[str, Any]:
+        report = self.audit_review(review_id)
+        if not report.passed and not force:
+            raise PolicyViolation(
+                "audit failed; review cannot be completed:\n"
+                + "\n".join(f"- {p}" for p in report.problems)
+            )
+        review = self.complete_review(review_id, request)
+        return {"review": review, "audit": report.to_dict(), "forced": force}
+
+    # --------------------------------------------------------------- cleanup
+    def cleanup_workspace(self, workspace_id: str, actor: str = "system") -> Workspace:
+        """Mark a workspace destroyed. The directory is the CLI's to remove — the
+        service does not delete a human's files."""
+        workspace = self._require_workspace(workspace_id)
+        self.storage.update_workspace(workspace_id, destroyed_at=self._now())
+        self.record_event(
+            workspace.task_id, "workspace_destroyed", actor, {"workspace_id": workspace_id}
+        )
+        return self._require_workspace(workspace_id)
+
+    def abandon_stale_sessions(self, older_than_seconds: float = 24 * 3600) -> list[str]:
+        """A session whose shell died without `end_shell` is abandoned, not running.
+
+        Without this, `audit` would keep measuring attempts against a session that
+        ended days ago, and the token would stay live.
+        """
+        cutoff = self._now() - max(0.0, older_than_seconds)
+        abandoned: list[str] = []
+        for session in self.storage.list_sessions(limit=1000):
+            if session.status not in (SessionStatus.prepared, SessionStatus.running):
+                continue
+            if session.started_at > cutoff:
+                continue
+            self.storage.update_session(
+                session.id, status=SessionStatus.abandoned.value, ended_at=self._now()
+            )
+            self.revoke_session_tokens(session.id)
+            abandoned.append(session.id)
+        return abandoned

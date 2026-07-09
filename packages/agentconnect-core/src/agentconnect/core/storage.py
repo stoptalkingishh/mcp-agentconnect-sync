@@ -36,12 +36,15 @@ from .models import (
     Event,
     ExternalRef,
     InboxItem,
+    ManagerSession,
     Review,
+    SessionToken,
     Subtask,
     Task,
     TaskFilters,
     TaskSummary,
     WorkerRun,
+    Workspace,
 )
 
 _SCHEMA = """
@@ -133,6 +136,29 @@ CREATE TABLE IF NOT EXISTS executions (
     entity_id TEXT NOT NULL, workflow_id TEXT, run_id TEXT, state TEXT NOT NULL,
     created_at REAL NOT NULL, updated_at REAL NOT NULL, detail TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY, task_id TEXT, review_id TEXT, path TEXT NOT NULL,
+    repo_path TEXT, artifact_path TEXT, repo_mode TEXT NOT NULL,
+    created_at REAL NOT NULL, destroyed_at REAL,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS manager_sessions (
+    id TEXT PRIMARY KEY, task_id TEXT, review_id TEXT, manager_id TEXT NOT NULL,
+    workspace_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL, claim_id TEXT,
+    started_at REAL NOT NULL, ended_at REAL,
+    launch_command TEXT NOT NULL DEFAULT '', shell_command TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS session_tokens (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+    scope_json TEXT NOT NULL DEFAULT '{}', expires_at REAL, revoked_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspaces_task ON workspaces(task_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_review ON workspaces(review_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_task ON manager_sessions(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_sessions_review ON manager_sessions(review_id, status);
+CREATE INDEX IF NOT EXISTS idx_tokens_session ON session_tokens(session_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_subtask ON approvals(subtask_id, status);
 CREATE INDEX IF NOT EXISTS idx_executions_entity ON executions(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_executions_workflow ON executions(workflow_id);
@@ -429,6 +455,7 @@ class SqliteStorage:
             ArtifactSummary(
                 id=r["id"], task_id=r["task_id"], type=r["type"], summary=r["summary"],
                 size_bytes=r["size_bytes"], created_by=r["created_by"], created_at=r["created_at"],
+                metadata=_u(r["metadata_json"], {}),
             )
             for r in rows
         ]
@@ -766,6 +793,178 @@ class SqliteStorage:
             entity_id=r["entity_id"], workflow_id=r["workflow_id"], run_id=r["run_id"],
             state=r["state"], created_at=r["created_at"], updated_at=r["updated_at"],
             detail=r["detail"],
+        )
+
+    # ---------------------------------------------------------- workspaces
+    def insert_workspace(self, w: Workspace) -> Workspace:
+        with self.transaction() as c:
+            c.execute(
+                "INSERT INTO workspaces (id,task_id,review_id,path,repo_path,artifact_path,"
+                "repo_mode,created_at,destroyed_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (w.id, w.task_id, w.review_id, w.path, w.repo_path, w.artifact_path,
+                 w.repo_mode.value, w.created_at, w.destroyed_at, _j(w.metadata)),
+            )
+        return w
+
+    def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone()
+        return self._workspace(row) if row else None
+
+    def find_workspace(
+        self, task_id: Optional[str] = None, review_id: Optional[str] = None
+    ) -> Optional[Workspace]:
+        """The live workspace for an entity. A destroyed one never matches."""
+        column, value = ("review_id", review_id) if review_id else ("task_id", task_id)
+        if not value:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM workspaces WHERE {column}=? AND destroyed_at IS NULL"
+                " ORDER BY created_at DESC LIMIT 1",
+                (value,),
+            ).fetchone()
+        return self._workspace(row) if row else None
+
+    def list_workspaces(self, include_destroyed: bool = False) -> list[Workspace]:
+        sql = "SELECT * FROM workspaces"
+        if not include_destroyed:
+            sql += " WHERE destroyed_at IS NULL"
+        sql += " ORDER BY created_at DESC"
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+        return [self._workspace(r) for r in rows]
+
+    def update_workspace(self, workspace_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.transaction() as c:
+            c.execute(f"UPDATE workspaces SET {cols} WHERE id=?",
+                      (*fields.values(), workspace_id))
+
+    @staticmethod
+    def _workspace(r: sqlite3.Row) -> Workspace:
+        return Workspace(
+            id=r["id"], task_id=r["task_id"], review_id=r["review_id"], path=r["path"],
+            repo_path=r["repo_path"], artifact_path=r["artifact_path"],
+            repo_mode=r["repo_mode"], created_at=r["created_at"],
+            destroyed_at=r["destroyed_at"], metadata=_u(r["metadata_json"], {}),
+        )
+
+    # ------------------------------------------------------ manager sessions
+    def insert_session(self, s: ManagerSession) -> ManagerSession:
+        with self.transaction() as c:
+            c.execute(
+                "INSERT INTO manager_sessions (id,task_id,review_id,manager_id,workspace_id,"
+                "mode,status,claim_id,started_at,ended_at,launch_command,shell_command,"
+                "metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (s.id, s.task_id, s.review_id, s.manager_id, s.workspace_id, s.mode.value,
+                 s.status.value, s.claim_id, s.started_at, s.ended_at, s.launch_command,
+                 s.shell_command, _j(s.metadata)),
+            )
+        return s
+
+    def get_session(self, session_id: str) -> Optional[ManagerSession]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM manager_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        return self._session(row) if row else None
+
+    def latest_session(
+        self, task_id: Optional[str] = None, review_id: Optional[str] = None,
+        statuses: Optional[tuple[str, ...]] = None,
+    ) -> Optional[ManagerSession]:
+        column, value = ("review_id", review_id) if review_id else ("task_id", task_id)
+        if not value:
+            return None
+        sql = f"SELECT * FROM manager_sessions WHERE {column}=?"
+        params: list[Any] = [value]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            params.extend(statuses)
+        sql += " ORDER BY started_at DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, tuple(params)).fetchone()
+        return self._session(row) if row else None
+
+    def list_sessions(
+        self, task_id: Optional[str] = None, manager_id: Optional[str] = None,
+        status: Optional[str] = None, limit: int = 50,
+    ) -> list[ManagerSession]:
+        clauses, params = [], []
+        if task_id:
+            clauses.append("task_id=?")
+            params.append(task_id)
+        if manager_id:
+            clauses.append("manager_id=?")
+            params.append(manager_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        sql = "SELECT * FROM manager_sessions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(max(0, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._session(r) for r in rows]
+
+    def update_session(self, session_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.transaction() as c:
+            c.execute(f"UPDATE manager_sessions SET {cols} WHERE id=?",
+                      (*fields.values(), session_id))
+
+    @staticmethod
+    def _session(r: sqlite3.Row) -> ManagerSession:
+        return ManagerSession(
+            id=r["id"], task_id=r["task_id"], review_id=r["review_id"],
+            manager_id=r["manager_id"], workspace_id=r["workspace_id"], mode=r["mode"],
+            status=r["status"], claim_id=r["claim_id"], started_at=r["started_at"],
+            ended_at=r["ended_at"], launch_command=r["launch_command"],
+            shell_command=r["shell_command"], metadata=_u(r["metadata_json"], {}),
+        )
+
+    # ------------------------------------------------------- session tokens
+    def insert_token(self, t: SessionToken, token_hash: str) -> SessionToken:
+        with self.transaction() as c:
+            c.execute(
+                "INSERT INTO session_tokens (id,session_id,token_hash,scope_json,expires_at,"
+                "revoked_at,created_at) VALUES (?,?,?,?,?,?,?)",
+                (t.id, t.session_id, token_hash, _j(t.scope), t.expires_at, t.revoked_at,
+                 t.created_at),
+            )
+        return t
+
+    def get_token_by_hash(self, token_hash: str) -> Optional[SessionToken]:
+        """The only lookup there is. A plaintext token is never stored, so it can
+        never be read back out — an attacker with the DB cannot impersonate."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_tokens WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+        return self._token(row) if row else None
+
+    def revoke_tokens_for_session(self, session_id: str, at: float) -> int:
+        with self.transaction() as c:
+            cur = c.execute(
+                "UPDATE session_tokens SET revoked_at=? WHERE session_id=? AND revoked_at IS NULL",
+                (at, session_id),
+            )
+        return cur.rowcount
+
+    @staticmethod
+    def _token(r: sqlite3.Row) -> SessionToken:
+        return SessionToken(
+            id=r["id"], session_id=r["session_id"], scope=_u(r["scope_json"], {}),
+            expires_at=r["expires_at"], revoked_at=r["revoked_at"], created_at=r["created_at"],
         )
 
     # -------------------------------------------------------------- events

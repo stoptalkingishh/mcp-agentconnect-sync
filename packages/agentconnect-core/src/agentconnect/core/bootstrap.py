@@ -10,6 +10,8 @@ Env:
   AGENTCONNECT_ARTIFACT_DIR   artifact bodies (default ~/.agentconnect/artifacts)
   AGENTCONNECT_MAX_COST_USD   standing budget ceiling for routing (default 0.0)
   AGENTCONNECT_WORKERS        comma-separated built-ins to register (default "echo")
+  AGENTCONNECT_WORKSPACE_DIR  managed agent workspaces (default ~/.agentconnect/workspaces)
+  AGENTCONNECT_API_URL        what a launched agent is told to call (default :8790)
 """
 
 from __future__ import annotations
@@ -111,10 +113,14 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
     return adapters, config
 
 
+DEFAULT_API_URL = "http://localhost:8790"
+
+
 def service_from_env(
     workers: Optional[list[WorkerAdapter]] = None,
     db_path: Optional[str] = None,
     artifact_dir: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
 ) -> AgentConnectService:
     adapters, memory_config = memory_from_env()
     return AgentConnectService.create(
@@ -124,4 +130,6 @@ def service_from_env(
         policy=policy_from_env(),
         memory_backends=adapters,
         memory_config=memory_config,
+        workspace_dir=workspace_dir or os.environ.get("AGENTCONNECT_WORKSPACE_DIR"),
+        api_url=os.environ.get("AGENTCONNECT_API_URL", DEFAULT_API_URL),
     )

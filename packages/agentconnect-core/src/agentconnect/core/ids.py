@@ -21,6 +21,9 @@ CONSTRAINT = "constraint"
 INBOX = "inbox"
 EVENT = "event"
 APPROVAL = "approval"
+SESSION = "session"
+WORKSPACE = "workspace"
+TOKEN = "token"
 
 
 def new_id(prefix: str) -> str:
