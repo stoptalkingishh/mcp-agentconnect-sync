@@ -181,16 +181,52 @@ def _recall(adapter, **kw):
 # 1. WikiBrain's own pack already carries the right verdicts
 # =============================================================================
 def test_wikibrain_returns_a_contradicted_claim_as_promoted_but_untrusted(ledger):
-    """The premise of everything below. If WikiBrain ever stops doing this, the
-    downstream assertions become vacuous rather than failing."""
+    """The premise of everything below. If WikiBrain ever stops emitting `trusted`
+    on a contradicted claim, the downstream assertions become vacuous rather than
+    failing, so assert the wire shape directly."""
     raw = ledger["transport"]("POST", f"{BASE_URL}/recall", {
-        "query": "refresh token rotation", "trusted_only": True})
+        "query": "refresh token rotation", "trusted_only": False})
     disputed = [i for i in raw["items"] if i["text"] == DISPUTED]
-    assert disputed, "WikiBrain should still return a contradicted claim"
+    assert disputed, "WikiBrain should surface a contradicted claim when asked"
     assert disputed[0]["status"] == "promoted"
     assert disputed[0]["trusted"] is False
     assert disputed[0]["contradicted"] is True
+    assert disputed[0]["contradiction_status"] == "open"
     assert any("contradiction" in w.lower() for w in raw["warnings"])
+
+
+def test_wikibrain_trusted_only_pack_contains_only_trusted_items(ledger):
+    """`trusted_only` means what it says at the source, too — defence in depth, not
+    a single check in one repo."""
+    raw = ledger["transport"]("POST", f"{BASE_URL}/recall", {
+        "query": "refresh token rotation", "trusted_only": True})
+    assert all(i["trusted"] is True for i in raw["items"])
+    assert DISPUTED not in [i["text"] for i in raw["items"]]
+    assert any("disputed" in w.lower() for w in raw["warnings"])
+
+
+def test_agentconnect_drops_a_disputed_claim_even_if_the_authority_sends_one(ledger):
+    """WikiBrain now withholds disputed claims from a trusted_only pack. AgentConnect
+    must still drop one if an older or sloppier authority sends it anyway."""
+    def sloppy(method, url, payload=None):
+        if url.endswith("/recall"):
+            return {"items": [
+                {"id": "claim_1", "text": DISPUTED, "status": "promoted",
+                 "trusted": False, "contradiction_status": "open",
+                 "confidence": "verified"},
+                {"id": "claim_2", "text": "A claim with no trusted field at all.",
+                 "status": "promoted", "confidence": "verified"},
+                {"id": "claim_3", "text": TRUSTED, "status": "promoted",
+                 "trusted": True, "confidence": "verified"},
+            ], "warnings": []}
+        raise AssertionError(url)
+
+    adapter = WikiBrainMemoryAdapter(base_url=BASE_URL, transport=sloppy)
+    pack = adapter.recall(RecallRequest(query="x", max_items=10))
+    assert [i.text for i in pack.items] == [TRUSTED]
+    assert any("disputed" in w.lower() for w in pack.warnings)
+    # An absent `trusted` is untrusted, never inferred from `status == "promoted"`.
+    assert any("did not mark them trusted" in w for w in pack.warnings)
 
 
 # =============================================================================
