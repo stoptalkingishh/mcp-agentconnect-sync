@@ -1,0 +1,29 @@
+# Mirrors .gitignore — keeps the build context small and clean for the
+# aronnax docker lab (docker/Dockerfile.agentconnect-base in the sibling
+# aronnax repo builds this repo as its context).
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.git/
+
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+config/secrets.yaml
+config/secrets.local.yaml
+.env
+*.pem
+*.key
