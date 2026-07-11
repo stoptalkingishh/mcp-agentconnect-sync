@@ -77,6 +77,13 @@ Guardrails enforced by structure:
 3. **Privacy class** → `privacy.classify` (§13)
 4. **Redaction pass** → `privacy.redact`, stored as a `sanitized_payload`
    artifact (§14). `secret_sensitive` → **fail closed** (REJECTED, never routed).
+4b. **Auto-retrieval** (§8.1 item 4 of aronnax's blueprint.md) →
+    `RouterService._auto_retrieve_context` calls `SharedMemory.search_memory`
+    itself and, on any hits, folds them into `submission.task`/`redacted_text`
+    before every downstream consumer (token estimate, routing, one-shot/
+    agentic prompt) sees it. Stored as an `auto_retrieved_context` artifact
+    when non-empty. Config: `routing.yaml` → `auto_retrieval`
+    (`enabled`/`limit`/`scope`).
 5. **Quality + token estimate** → `tokens.estimate_io_tokens`
 6. **Fetch local status** → `LocalClient.status()` (§5)
 7. **Eligibility** → `RoutingEngine.eligibility` applies HARD constraints (§12)

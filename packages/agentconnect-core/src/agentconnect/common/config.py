@@ -153,6 +153,10 @@ class RoutingConfig:
         return self.raw.get("local_inference_defaults", {})
 
     @property
+    def auto_retrieval(self) -> dict[str, Any]:
+        return self.raw.get("auto_retrieval", {})
+
+    @property
     def scoring(self) -> dict[str, Any]:
         return self.raw.get("scoring", {})
 

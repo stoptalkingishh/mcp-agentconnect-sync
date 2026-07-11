@@ -182,6 +182,12 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
         """Submit a task for routing. Returns a COMPACT summary + artifact refs
         (never full output). Use read_artifact_chunk / get_log_slice for detail.
 
+        Automatically retrieves relevant prior context from shared memory
+        (search_memory) and folds it into the task before routing/dispatch —
+        no need to call search_memory yourself first. See the
+        auto_retrieved_context artifact ref in the returned summary, if any
+        hits were found. Config: routing.yaml's auto_retrieval section.
+
         Set allow_rented=True to permit a repo_sensitive task to run on a trusted
         rented GPU node (for very large private models).
 

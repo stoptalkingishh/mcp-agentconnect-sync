@@ -375,6 +375,28 @@ class RouterService:
         hard = int(self.routing_cfg.mcp_output_policy.get("hard_max_chars", 12000))
         return text if len(text) <= hard else text[:hard]
 
+    def _auto_retrieve_context(self, task_id: str, query: str) -> Optional[str]:
+        """§8.1 item 4: submit_task calls search_memory itself rather than
+        relying on a manager agent to do it by convention. search_memory is a
+        local SQLite substring search over already-redacted store content
+        (sanitized_payload/output artifacts), so no additional redaction pass
+        is needed on what it returns."""
+        cfg = self.routing_cfg.auto_retrieval
+        if not cfg.get("enabled", True):
+            return None
+        limit = int(cfg.get("limit", 3))
+        hits = self.memory.search_memory(query, scope=cfg.get("scope", "all"), limit=limit)
+        if not hits:
+            return None
+        lines = [
+            f"- ({h['type']}{':' + h['kind'] if 'kind' in h else ''} {h['id']}) {h['snippet']}"
+            for h in hits
+        ]
+        block = "Relevant prior context (auto-retrieved from memory, not authoritative):\n" + "\n".join(lines)
+        self.memory.put_artifact(task_id, "auto_retrieved_context", block)
+        self.memory.append_log(task_id, f"auto_retrieval hits={len(hits)}")
+        return block
+
     # --------------------------------------------------------- MCP: submit_task
     def submit_task(self, submission: TaskSubmission) -> TaskSummary:
         # 1-2. Receive + assign id.
@@ -416,6 +438,15 @@ class RouterService:
                 recommended_next_action="Remove/redact secrets or handle out-of-band; do not route to an LLM.",
             )
             return self._summary(task_id)
+
+        # Auto-retrieval (§8.1 item 4): fold relevant prior memory into the task
+        # text now, before it's used for token estimation, routing, or the
+        # one-shot/agentic prompt below — every downstream consumer of
+        # submission.task/redacted_text sees the augmented version.
+        context_block = self._auto_retrieve_context(task_id, submission.task)
+        if context_block:
+            submission.task = f"{context_block}\n\n{submission.task}"
+            redacted_text = f"{context_block}\n\n{redacted_text}"
 
         # 5-6. Quality requirement + token estimate.
         max_out = submission.constraints.max_output_tokens or int(

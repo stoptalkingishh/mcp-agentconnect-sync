@@ -48,6 +48,15 @@ local_inference_defaults:
   max_model_len: 16384
   default_max_output_tokens: 1200
 
+# --- Automatic retrieval-on-new-task (blueprint.md §8.1 item 4) --------------
+# submit_task() calls search_memory itself instead of relying on a manager
+# agent to do it by convention. Purely local SQLite substring search, so it
+# runs before privacy/routing decisions are final with no leakage risk.
+auto_retrieval:
+  enabled: true
+  limit: 3
+  scope: all
+
 # --- Provider scoring weights (§12) ------------------------------------------
 # score = sum(bonus terms) - sum(penalty terms). Hard constraints override.
 scoring:

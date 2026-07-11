@@ -63,3 +63,45 @@ def test_cancel_task():
     svc.memory.update_task(tid, state=TaskState.QUEUED.value)
     out = svc.cancel_task(tid)
     assert out["state"] == TaskState.CANCELLED.value
+
+
+def test_auto_retrieval_attaches_prior_context():
+    svc = _service()
+    task_text = "Where does the auth token refresh helper live?"
+    prior_id = svc.memory.create_task({"task": "seed"})
+    svc.memory.update_task(
+        prior_id,
+        summary=f"Notes: '{task_text}' -> answered via session/refresh.py in an earlier task.",
+    )
+
+    sub = TaskSubmission(
+        task=task_text,
+        constraints=TaskConstraints(privacy_class="repo_sensitive"),
+    )
+    summary = svc.submit_task(sub)
+
+    assert summary.status == TaskState.COMPLETE
+    assert "auto_retrieved_context" in summary.artifacts
+    block = svc.read_artifact_chunk(summary.artifacts["auto_retrieved_context"])["content"]
+    assert prior_id in block
+    assert "session/refresh.py" in block
+    # The routing decision's own record shows the augmented (context-prefixed)
+    # text made it all the way to token estimation.
+    decisions = svc.memory.get_routing_decisions(summary.task_id)
+    assert decisions
+
+
+def test_auto_retrieval_disabled_via_config():
+    svc = _service()
+    svc.routing_cfg.raw["auto_retrieval"] = {"enabled": False}
+    task_text = "Where does the auth token refresh helper live?"
+    prior_id = svc.memory.create_task({"task": "seed"})
+    svc.memory.update_task(
+        prior_id,
+        summary=f"Notes: '{task_text}' -> answered via session/refresh.py in an earlier task.",
+    )
+
+    sub = TaskSubmission(task=task_text, constraints=TaskConstraints(privacy_class="repo_sensitive"))
+    summary = svc.submit_task(sub)
+
+    assert "auto_retrieved_context" not in summary.artifacts
