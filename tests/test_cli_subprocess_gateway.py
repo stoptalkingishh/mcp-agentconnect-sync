@@ -93,6 +93,11 @@ def test_claude_json_mode_extracts_result_and_usage():
     # --tools variadic-greedy bug found live-testing this).
     _cmd, kwargs = run.call_args
     assert kwargs["input"] == "what do you think?"
+    # Real bug found live-testing this: without an explicit encoding,
+    # subprocess.run's text=True falls back to the platform default (cp1252
+    # on Windows), silently corrupting any non-ASCII character an LLM's
+    # response naturally contains (em-dashes, smart quotes, ...).
+    assert kwargs["encoding"] == "utf-8"
 
 
 def test_claude_is_error_true_raises_and_reports_failure():
