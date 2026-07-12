@@ -154,6 +154,11 @@ class Compressor:
             protected = _compress_prose(protected)
 
         restored = _restore(_restore(protected, url_tokens), code_tokens)
+        # Compression is an optimization, never a semantic requirement. If a
+        # heuristic expands the payload, retain the byte-for-byte original so
+        # the gateway cannot spend more tokens or alter content for no gain.
+        if len(restored) >= original_chars:
+            return text, CompressionStats(original_chars, original_chars)
         return restored, CompressionStats(original_chars, len(restored))
 
     def compress_for_provider(

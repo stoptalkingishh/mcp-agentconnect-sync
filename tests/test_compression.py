@@ -94,3 +94,17 @@ def test_from_config_defaults():
     c2 = Compressor.from_config({"enabled": False, "min_chars_to_compress": 42})
     assert c2.enabled is False
     assert c2.min_chars_to_compress == 42
+
+
+def test_inflation_guard_returns_original(monkeypatch):
+    c = Compressor(min_chars_to_compress=1, apply_to=("prose",))
+    original = "compact input"
+    monkeypatch.setattr(
+        "agentconnect.common.compression._compress_prose",
+        lambda text: text + " expanded",
+    )
+
+    out, stats = c.compress_text(original, "prose")
+
+    assert out == original
+    assert stats.original_chars == stats.compressed_chars == len(original)

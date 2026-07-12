@@ -305,13 +305,25 @@ Without the `[web]` extra installed, `web` mode logs a warning and falls back to
 - Cloud provider configs hold **secret references only**. The gateway is the sole
   component that resolves a cloud secret, at call time, and never returns/logs it.
 
+## Optional OmniRoute transport
+
+Set `OMNIROUTE_BASE_URL` (for example `http://127.0.0.1:20128`) to send the
+configured Gemini, Groq, and OpenRouter providers through OmniRoute's explicit
+provider-scoped endpoints. AgentConnect still selects and reports the downstream
+provider; OmniRoute `auto` and combo routing are deliberately not used because
+they would hide the destination from privacy, budget, and explain-route policy.
+
+When `OMNIROUTE_BASE_URL` is unset, those providers use their direct API
+endpoints. Provider-specific model maps translate AgentConnect's abstract worker
+profiles into currently supported API model identifiers in either mode.
+
 ## Status vs. the phased plan (§25)
 
 A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 322 tests):** the
+**All six phases implemented end-to-end (offline, tested):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
@@ -325,7 +337,9 @@ trusted rented private nodes (opt-in, acquire-once-bill-once), capability matchi
 (ticket-to-worker filter, not a gate), and broker-side operator view (queue
 visibility + in_review backlog with approve/reject web host). Cloud calls and the
 local backend degrade to deterministic stubs until real endpoints/credentials are
-supplied. CI runs the suite on 3.10–3.12 and verifies the Router builds standalone.
+supplied. Cloud requests fail closed when credentials, transport, or response
+parsing fails; no production path converts those failures into successful stub
+output. CI runs the suite on 3.10–3.12 and verifies the Router builds standalone.
 See `docs/ARCHITECTURE.md` for the section-by-section map.
 
 ## License

@@ -4,6 +4,8 @@ compression concepts)."""
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from agentconnect.common.compression import Compressor
 from agentconnect.common.config import ProviderConfig
 from agentconnect.common.memory import SharedMemory
@@ -21,17 +23,28 @@ def _req(content="hello"):
     return GenerateRequest(request_id="r1", task_id="t1", model_id="m1", messages=[{"role": "user", "content": content}])
 
 
-def test_gateway_notifies_failure_even_though_stub_masks_it():
+def test_gateway_notifies_and_surfaces_failure():
     events = []
     secrets = MagicMock()
     secrets.resolve.return_value = "fake-key"
     gw = ProviderGateway(secret_resolver=secrets, on_call_result=lambda *a: events.append(a))
     gw._http_openai_compatible = MagicMock(side_effect=RuntimeError("connection refused"))
 
-    result = gw.call(_CFG, _req())
-
-    assert result.output_text.startswith("[cloud-stub:")  # stub fallback unchanged
+    with pytest.raises(RuntimeError, match="request failed"):
+        gw.call(_CFG, _req())
     assert events == [("test_cloud", False, "connection refused")]
+
+
+def test_gateway_surfaces_missing_credential():
+    events = []
+    secrets = MagicMock()
+    secrets.resolve.side_effect = KeyError("missing")
+    gw = ProviderGateway(secret_resolver=secrets, on_call_result=lambda *a: events.append(a))
+
+    with pytest.raises(RuntimeError, match="No usable credential"):
+        gw.call(_CFG, _req())
+
+    assert events == [("test_cloud", False, "'missing'")]
 
 
 def test_gateway_notifies_success():
@@ -59,6 +72,30 @@ def test_gateway_compresses_outbound_message_before_http_call():
 
     sent_req = gw._http_openai_compatible.call_args[0][1]
     assert "It is worth noting that" not in sent_req.messages[0]["content"]
+
+
+def test_gateway_maps_abstract_model_and_adds_gateway_prefix():
+    secrets = MagicMock()
+    secrets.resolve.return_value = "local-gateway-key"
+    cfg = ProviderConfig(
+        provider_id="groq_free",
+        type="cloud",
+        endpoint="http://localhost/v1/providers/groq",
+        privacy="external",
+        capabilities=(),
+        secret_ref="env://omniroute",
+        model_map={"worker-large": "qwen/qwen3-32b"},
+        model_prefix="groq/",
+    )
+    gw = ProviderGateway(secret_resolver=secrets)
+    gw._http_openai_compatible = MagicMock(
+        return_value=GatewayResult("ok", 1, 1, "groq_free", "groq/qwen/qwen3-32b")
+    )
+
+    gw.call(cfg, _req().model_copy(update={"model_id": "worker-large"}))
+
+    sent_req = gw._http_openai_compatible.call_args[0][1]
+    assert sent_req.model_id == "groq/qwen/qwen3-32b"
 
 
 def test_gateway_no_compressor_leaves_message_untouched():

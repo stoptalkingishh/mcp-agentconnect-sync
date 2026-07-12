@@ -69,7 +69,7 @@ providers:
 
   gemini_free:
     type: cloud
-    endpoint: "https://generativelanguage.googleapis.com"
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
     secret_ref: "op://AI/gemini/api-key"
     privacy: external
     # Generic capability names (summarization/classification/reasoning/coding) are
@@ -80,6 +80,14 @@ providers:
       reset: daily
       max_daily_requests: 1500
       max_daily_tokens: 1000000
+    model_map:
+      qwen3.6-35b-a3b: gemini-flash-latest
+      ornith-1.0-35b: gemini-flash-latest
+      qwen3.6-27b: gemini-flash-latest
+      small-summarizer: gemini-flash-lite-latest
+    gateway:
+      base_url_env: OMNIROUTE_BASE_URL
+      provider: gemini
 
   groq_free:
     type: cloud
@@ -92,6 +100,14 @@ providers:
       reset: daily
       max_daily_requests: 14400
       max_daily_tokens: 500000
+    model_map:
+      qwen3.6-35b-a3b: qwen/qwen3-32b
+      ornith-1.0-35b: qwen/qwen3-32b
+      qwen3.6-27b: qwen/qwen3-32b
+      small-summarizer: llama-3.1-8b-instant
+    gateway:
+      base_url_env: OMNIROUTE_BASE_URL
+      provider: groq
 
   openai_paid:
     type: cloud
@@ -119,6 +135,14 @@ providers:
       reset: daily
       max_daily_requests: 50
       max_daily_tokens: 500000
+    model_map:
+      qwen3.6-35b-a3b: openrouter/free
+      ornith-1.0-35b: openrouter/free
+      qwen3.6-27b: openrouter/free
+      small-summarizer: openrouter/free
+    gateway:
+      base_url_env: OMNIROUTE_BASE_URL
+      provider: openrouter
 
   # Cheap paid tier (Grok models) — low per-token cost makes it a reasonable
   # fallback once free-tier quota is exhausted, ahead of openai_paid.

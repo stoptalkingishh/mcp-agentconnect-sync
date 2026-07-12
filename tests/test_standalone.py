@@ -42,7 +42,7 @@ def test_build_service_standalone_cloud_only(monkeypatch, tmp_path):
     assert "gemini_free" in status["providers"]
 
 
-def test_public_task_routes_cloud_when_no_local(monkeypatch, tmp_path):
+def test_public_task_fails_closed_without_cloud_credentials(monkeypatch, tmp_path):
     from agentconnect.common.schemas import TaskConstraints, TaskState, TaskSubmission
     from agentconnect.router.service import RouterService
 
@@ -53,6 +53,12 @@ def test_public_task_routes_cloud_when_no_local(monkeypatch, tmp_path):
         constraints=TaskConstraints(privacy_class="public"),
     )
     summary = svc.submit_task(sub)
-    assert summary.status == TaskState.COMPLETE
+    assert summary.status == TaskState.FAILED
     decisions = svc.memory.get_routing_decisions(summary.task_id)
-    assert decisions[-1]["selected_provider"] in {"gemini_free", "groq_free", "openai_paid"}
+    assert decisions[-1]["selected_provider"] in {
+        "gemini_free",
+        "groq_free",
+        "openai_paid",
+        "openrouter_free",
+        "xai_free",
+    }

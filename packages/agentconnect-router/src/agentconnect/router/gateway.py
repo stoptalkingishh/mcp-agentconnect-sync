@@ -108,40 +108,30 @@ class ProviderGateway:
     def _call_cloud(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:
         """Cloud call. Resolves the API key at call time and never returns it.
 
-        This scaffold implements an OpenAI-compatible chat call and degrades to a
-        deterministic stub when the SDK/network/credentials are unavailable, so
-        the pipeline stays exercisable offline. A production build would remove
-        the stub fallback and surface errors.
+        Provider and credential failures are surfaced to the caller. A failed
+        cloud request must never be reported as a successful task.
         """
         try:
-            api_key = self._secrets.resolve(cfg.secret_ref)  # noqa: F841  (used below, never logged)
-        except Exception:
-            api_key = None
+            api_key = self._secrets.resolve(cfg.secret_ref)
+        except Exception as exc:
+            if self._on_result:
+                self._on_result(cfg.provider_id, False, str(exc))
+            raise RuntimeError(f"No usable credential for cloud provider {cfg.provider_id}") from exc
 
-        if api_key:
-            call_req = self._compressed(cfg, req)
-            try:
-                result = self._http_openai_compatible(cfg, call_req, api_key)
-            except Exception as exc:
-                # Still falls through to the deterministic stub below (no
-                # behavior change there — a production build would remove
-                # that fallback and surface errors) but the caller now learns
-                # a real call actually failed, which it could not before.
-                if self._on_result:
-                    self._on_result(cfg.provider_id, False, str(exc))
-            else:
-                if self._on_result:
-                    self._on_result(cfg.provider_id, True, None)
-                return result
+        model_id = cfg.model_map.get(req.model_id, req.model_id)
+        if cfg.model_prefix and not model_id.startswith(cfg.model_prefix):
+            model_id = cfg.model_prefix + model_id
+        call_req = self._compressed(cfg, req.model_copy(update={"model_id": model_id}))
+        try:
+            result = self._http_openai_compatible(cfg, call_req, api_key)
+        except Exception as exc:
+            if self._on_result:
+                self._on_result(cfg.provider_id, False, str(exc))
+            raise RuntimeError(f"Cloud provider {cfg.provider_id} request failed") from exc
 
-        text = f"[cloud-stub:{cfg.provider_id}/{req.model_id}] task {req.task_id} (no live call)."
-        return GatewayResult(
-            output_text=text,
-            input_tokens=sum(len(str(m.get("content", ""))) for m in req.messages) // 4,
-            output_tokens=len(text) // 4 + 1,
-            provider=cfg.provider_id,
-            model=req.model_id,
-        )
+        if self._on_result:
+            self._on_result(cfg.provider_id, True, None)
+        return result
 
     def _http_openai_compatible(
         self, cfg: ProviderConfig, req: GenerateRequest, api_key: str
@@ -154,6 +144,7 @@ class ProviderGateway:
             "messages": req.messages,
             "max_tokens": req.max_output_tokens,
             "temperature": req.temperature,
+            "stream": False,
         }
         headers = {"Authorization": f"Bearer {api_key}"}
         with httpx.Client(timeout=60.0) as client:

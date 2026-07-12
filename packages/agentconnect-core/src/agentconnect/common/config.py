@@ -117,6 +117,8 @@ class ProviderConfig:
     node_class: str | None = None  # owned | rented (for type == "local")
     tls: TlsClientConfig | None = None
     rental: RentalConfig | None = None
+    model_map: dict[str, str] = field(default_factory=dict)
+    model_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -204,10 +206,18 @@ def load_providers() -> ProviderRegistryConfig:
     data = _load_yaml("providers.yaml")
     providers: dict[str, ProviderConfig] = {}
     for pid, cfg in (data.get("providers") or {}).items():
+        endpoint = cfg.get("endpoint", "")
+        model_prefix = ""
+        gateway = cfg.get("gateway", {}) or {}
+        gateway_base = os.environ.get(gateway.get("base_url_env", ""), "").strip()
+        if gateway_base:
+            gateway_provider = gateway.get("provider", pid)
+            endpoint = f"{gateway_base.rstrip('/')}/v1/providers/{gateway_provider}"
+            model_prefix = f"{gateway_provider}/"
         providers[pid] = ProviderConfig(
             provider_id=pid,
             type=cfg["type"],
-            endpoint=cfg.get("endpoint", ""),
+            endpoint=endpoint,
             secret_ref=cfg.get("secret_ref"),  # optional; local nodes use mTLS
             privacy=cfg["privacy"],
             capabilities=tuple(cfg.get("capabilities", [])),
@@ -217,6 +227,8 @@ def load_providers() -> ProviderRegistryConfig:
             node_class=cfg.get("node_class"),
             tls=_parse_tls(cfg.get("tls")),
             rental=_parse_rental(cfg.get("rental")),
+            model_map=dict(cfg.get("model_map", {}) or {}),
+            model_prefix=model_prefix,
         )
     return ProviderRegistryConfig(
         policy_version=data.get("policy_version", "unknown"),
