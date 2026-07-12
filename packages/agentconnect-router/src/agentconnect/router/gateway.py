@@ -14,14 +14,28 @@ ever see the provider id.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 from ..common.compression import Compressor
-from ..common.config import ProviderConfig
+from ..common.config import CliConfig, ProviderConfig
 from ..common.schemas import GenerateRequest
 from ..common.secrets import SecretResolver
 from .local_client import HttpLocalClient, LocalClient
+
+
+def _default_cli_scratch_dir() -> Path:
+    """Fixed, neutral working directory for cli_subprocess providers with no
+    explicit `cli.cwd` configured -- deliberately never the router process's
+    own cwd (which could be a real repo checkout). See `CliConfig`'s
+    docstring: even a read-only sandbox mode still lets the CLI *read*
+    whatever's in its working directory, so this is a real safety property,
+    not cosmetic."""
+    return Path(tempfile.gettempdir()) / "agentconnect-cli-scratch"
 
 
 @dataclass
@@ -84,6 +98,8 @@ class ProviderGateway:
                 provider=cfg.provider_id,
                 model=resp.model_id,
             )
+        if cfg.type == "cli_subprocess":
+            return self._call_cli_subprocess(cfg, req)
         return self._call_cloud(cfg, req)
 
     def _compressed(self, cfg: ProviderConfig, req: GenerateRequest) -> GenerateRequest:
@@ -160,3 +176,119 @@ class ProviderGateway:
             provider=cfg.provider_id,
             model=req.model_id,
         )
+
+    # --------------------------------------------------------- cli_subprocess
+    def _call_cli_subprocess(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:
+        """CLI-subprocess call for a subscription-authenticated coding-agent
+        CLI (claude_cli/codex_cli). No secret is resolved or held here — the
+        CLI authenticates via its own ambient login state, entirely outside
+        this gateway's secret-resolution path (see
+        config/secrets.example.yaml's `cli_subprocess` note).
+
+        Failures are surfaced to the caller, matching `_call_cloud`'s
+        convention: a failed CLI invocation must never be reported as a
+        successful task. `_on_result` still fires first so the circuit
+        breaker learns about the failure either way.
+        """
+        cli = cfg.cli
+        if cli is None:
+            raise RuntimeError(f"cli_subprocess provider {cfg.provider_id} has no `cli` config.")
+
+        prompt = self._render_cli_prompt(self._compressed(cfg, req))
+        try:
+            result = self._run_cli(cfg, cli, prompt)
+        except Exception as exc:
+            if self._on_result:
+                self._on_result(cfg.provider_id, False, str(exc))
+            raise RuntimeError(f"cli_subprocess provider {cfg.provider_id} failed") from exc
+
+        if self._on_result:
+            self._on_result(cfg.provider_id, True, None)
+        return result
+
+    @staticmethod
+    def _render_cli_prompt(req: GenerateRequest) -> str:
+        """Render `req.messages` into the single text blob a CLI's stdin
+        expects. A single message needs no role framing; multiple messages
+        get bracketed role headers so the CLI can tell them apart."""
+        if len(req.messages) == 1:
+            return str(req.messages[0].get("content", ""))
+        return "\n\n".join(
+            f"[{m.get('role', 'user')}]\n{m.get('content', '')}" for m in req.messages
+        )
+
+    def _run_cli(self, cfg: ProviderConfig, cli: CliConfig, prompt: str) -> GatewayResult:
+        cwd = Path(cli.cwd) if cli.cwd else _default_cli_scratch_dir()
+        cwd.mkdir(parents=True, exist_ok=True)
+
+        args = list(cli.args)
+        output_file_path: Path | None = None
+        if cli.output_mode == "output_file":
+            if not cli.output_file_flag:
+                raise RuntimeError(
+                    f"cli_subprocess provider {cfg.provider_id}: "
+                    "output_mode=output_file requires output_file_flag"
+                )
+            fd, raw_path = tempfile.mkstemp(prefix="agentconnect-cli-", suffix=".txt")
+            import os
+
+            os.close(fd)
+            output_file_path = Path(raw_path)
+            args = [*args, cli.output_file_flag, str(output_file_path)]
+
+        try:
+            proc = subprocess.run(
+                [cli.binary, *args],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=cli.timeout_seconds,
+                cwd=str(cwd),
+            )
+            if cli.output_mode == "stdout_json":
+                output_text, input_tokens, output_tokens = self._parse_cli_json(
+                    cfg, proc.returncode, proc.stdout, proc.stderr
+                )
+            else:
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"{cfg.provider_id} exited {proc.returncode}: {proc.stderr[:500]}"
+                    )
+                if cli.output_mode == "output_file":
+                    output_text = output_file_path.read_text(encoding="utf-8").strip()
+                else:  # "stdout" plain text
+                    output_text = proc.stdout.strip()
+                # No structured usage available in these modes -- same rough
+                # chars/4 heuristic _call_cloud's own stub fallback already
+                # uses, not a claim of precision.
+                input_tokens = len(prompt) // 4
+                output_tokens = len(output_text) // 4
+        finally:
+            if output_file_path is not None:
+                output_file_path.unlink(missing_ok=True)
+
+        return GatewayResult(
+            output_text=output_text[: cli.max_output_chars],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            provider=cfg.provider_id,
+            # No separate model_id concept for a CLI subprocess -- the CLI
+            # picks/switches its own model internally.
+            model=cfg.provider_id,
+        )
+
+    @staticmethod
+    def _parse_cli_json(
+        cfg: ProviderConfig, returncode: int, stdout: str, stderr: str
+    ) -> tuple[str, int, int]:
+        """Parse Claude Code's `--output-format json` envelope (confirmed
+        live: `{"type": "result", "is_error": bool, "result": "<text>",
+        "usage": {"input_tokens": int, "output_tokens": int, ...}, ...}`)."""
+        if returncode != 0:
+            raise RuntimeError(f"{cfg.provider_id} exited {returncode}: {stderr[:500]}")
+        data = json.loads(stdout)
+        if data.get("is_error"):
+            raise RuntimeError(f"{cfg.provider_id} returned is_error=true: {data.get('result')!r}")
+        output_text = data.get("result", "")
+        usage = data.get("usage") or {}
+        return output_text, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))

@@ -98,6 +98,15 @@ class TaskConstraints(BaseModel):
     # observations would otherwise be fed back to an external model (see
     # RouterService._run_agentic).
     execution: str = "oneshot"
+    # Pins routing to exactly this provider_id, short-circuiting scoring
+    # competition against every other eligible provider (RoutingEngine.route
+    # still runs eligibility() on it -- policy is never bypassed, only the
+    # scoring contest is). Distinct from require_exact_model, which pins a
+    # *model id* for local residency, not a provider. v1's only caller is
+    # the council orchestrator (aronnax-council), which needs each persona
+    # dispatched to a specific, distinct provider rather than whichever one
+    # wins scoring.
+    required_provider: Optional[str] = None
 
 
 class TaskSubmission(BaseModel):

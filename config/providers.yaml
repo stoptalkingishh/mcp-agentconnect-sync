@@ -158,3 +158,52 @@ providers:
       # $ per 1K tokens, used for spend estimation / budget enforcement.
       price_per_1k_input_usd: 0.0002
       price_per_1k_output_usd: 0.0005
+
+  # Subscription-authenticated CLI tools, not API-key cloud endpoints -- see
+  # config.py's CliConfig docstring for the full trust-model rationale. No
+  # secret_ref: authentication is whatever this OS user is already logged
+  # into via the CLI's own session state, which the router never resolves,
+  # sees, or can rotate -- treat `privacy: external_paid` as fail-closed
+  # (budget-gated) even though there's no per-call meter to price against.
+  # `cli.args` deliberately never grants tool/file/write access -- prompt
+  # goes via stdin (both CLIs support it; sidesteps a real bug found live-
+  # testing this: Claude Code's `--tools <tools...>` is a greedy variadic
+  # flag that silently swallows a trailing positional prompt argument).
+  # v1 reachability: pinned via required_provider by the council orchestrator
+  # only -- not exposed to general task scoring (see blueprint.md's council
+  # research notes for why: no metered quota signal to price against, and
+  # broader exposure is a separate, deliberately deferred decision).
+  claude_cli:
+    type: cli_subprocess
+    privacy: external_paid
+    capabilities: [reasoning, coding, review]
+    cli:
+      binary: "claude"  # resolved via PATH; confirmed present (`where claude`)
+      args: ["-p", "--output-format", "json", "--tools", ""]
+      output_mode: stdout_json
+      # cwd intentionally unset -- gateway.py defaults a cli_subprocess
+      # provider with no explicit cwd to a fixed, neutral scratch directory
+      # rather than inheriting the router process's own cwd (which could be
+      # a real repo checkout). Override here only with a deliberately chosen
+      # non-project directory.
+      timeout_seconds: 120
+      max_output_chars: 20000
+    quota:
+      kind: subscription_unmetered
+
+  codex_cli:
+    type: cli_subprocess
+    privacy: external_paid
+    capabilities: [reasoning, coding, review]
+    cli:
+      # Not on PATH on this machine -- absolute path to the real installed
+      # binary. Override per-deployment if this differs elsewhere.
+      binary: "C:\\Users\\Ismael\\.codex\\.sandbox-bin\\codex.exe"
+      args: ["exec", "-s", "read-only", "--skip-git-repo-check"]
+      output_mode: output_file
+      output_file_flag: "-o"
+      # cwd intentionally unset -- see claude_cli's comment above.
+      timeout_seconds: 180
+      max_output_chars: 20000
+    quota:
+      kind: subscription_unmetered

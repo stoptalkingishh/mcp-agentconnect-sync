@@ -104,6 +104,49 @@ class RentalConfig:
 
 
 @dataclass(frozen=True)
+class CliConfig:
+    """Non-interactive subprocess invocation settings for a locally installed,
+    subscription-authenticated coding-agent CLI (``type == "cli_subprocess"``
+    providers -- e.g. Claude Code, Codex).
+
+    No ``secret_ref``: authentication is whatever the OS user already has the
+    CLI logged into (OAuth/session state under the CLI's own config dir) --
+    a third, distinct trust category from mTLS (local nodes) and
+    ``secret_ref`` (cloud providers), see ``config/secrets.yaml``'s header
+    note. The router never resolves or sees a credential for this provider
+    type; it can't rotate or scope it either, which is why callers must not
+    assume it behaves like the other two.
+
+    ``args`` are the full non-interactive invocation flags, NOT including the
+    prompt itself -- the prompt is always piped via stdin (both CLIs support
+    this; it also sidesteps a real bug found live-testing this: Claude
+    Code's ``--tools <tools...>`` is a greedy variadic flag that silently
+    swallows a trailing positional prompt argument). ``args`` must never
+    include a workspace/write-access flag (``--add-dir``, Codex's
+    ``-s workspace-write``/``danger-full-access``) -- that lockdown is
+    enforced here in config, not left as a per-call option downstream in the
+    gateway, so this provider's privacy tier stays true to what the invoked
+    process can actually touch on disk.
+
+    ``cwd`` is a fixed, neutral working directory -- deliberately never the
+    router process's own cwd (which could be a real repo checkout). Even a
+    read-only sandbox mode still lets the CLI *read* whatever's in its
+    working directory; pinning ``cwd`` away from real project content is
+    what actually prevents that, not the sandbox flag alone (confirmed by
+    live-testing ``codex exec`` without ``-C``: it defaulted to the
+    launching process's cwd).
+    """
+
+    binary: str
+    args: tuple[str, ...] = ()
+    output_mode: str = "stdout"  # "stdout_json" | "output_file"
+    output_file_flag: str | None = None  # e.g. "-o"; required when output_mode == "output_file"
+    cwd: str | None = None
+    timeout_seconds: float = 120.0
+    max_output_chars: int = 20000
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     provider_id: str
     type: str
@@ -119,6 +162,7 @@ class ProviderConfig:
     rental: RentalConfig | None = None
     model_map: dict[str, str] = field(default_factory=dict)
     model_prefix: str = ""
+    cli: CliConfig | None = None  # for type == "cli_subprocess" only
 
 
 @dataclass(frozen=True)
@@ -202,6 +246,20 @@ def _parse_rental(raw: dict[str, Any] | None) -> RentalConfig | None:
     )
 
 
+def _parse_cli(raw: dict[str, Any] | None) -> CliConfig | None:
+    if not raw:
+        return None
+    return CliConfig(
+        binary=_expand(raw["binary"]),
+        args=tuple(raw.get("args", [])),
+        output_mode=raw.get("output_mode", "stdout"),
+        output_file_flag=raw.get("output_file_flag"),
+        cwd=_expand(raw.get("cwd")),
+        timeout_seconds=float(raw.get("timeout_seconds", 120.0)),
+        max_output_chars=int(raw.get("max_output_chars", 20000)),
+    )
+
+
 def load_providers() -> ProviderRegistryConfig:
     data = _load_yaml("providers.yaml")
     providers: dict[str, ProviderConfig] = {}
@@ -229,6 +287,7 @@ def load_providers() -> ProviderRegistryConfig:
             rental=_parse_rental(cfg.get("rental")),
             model_map=dict(cfg.get("model_map", {}) or {}),
             model_prefix=model_prefix,
+            cli=_parse_cli(cfg.get("cli")),
         )
     return ProviderRegistryConfig(
         policy_version=data.get("policy_version", "unknown"),

@@ -46,6 +46,9 @@ class RoutingContext:
     pending_same_model_batch: int = 0
     # Opt-in for running a repo_sensitive task on a rented GPU node (Goal 4).
     allow_rented: bool = False
+    # Pins routing to exactly this provider_id (TaskConstraints.required_provider,
+    # see its docstring). route() still runs eligibility() on it.
+    required_provider: Optional[str] = None
 
 
 @dataclass
@@ -232,6 +235,27 @@ class RoutingEngine:
                 gate = self._budget_gate(cfg, ctx)
                 if gate:
                     return False, gate
+        elif cfg.type == "cli_subprocess":
+            # Subscription-authenticated CLI (claude_cli/codex_cli): data
+            # still leaves the box exactly like a cloud call, so it gets the
+            # same external/paid/redaction gating cloud providers get.
+            # `quota.can_reserve` degrades to an always-pass for these (no
+            # max_daily_* caps configured -- `quota.kind:
+            # subscription_unmetered`), called anyway for forward
+            # compatibility if a real cap is ever added.
+            if not ctx.allow_external:
+                return False, "external_routing_not_allowed_for_task"
+            if ctx.privacy_class in (PrivacyClass.low_sensitive,) and not ctx.cloud_safe:
+                return False, "redaction_failed_not_cloud_safe"
+            if cfg.privacy == "external_paid" and not ctx.allow_paid:
+                return False, "paid_routing_not_allowed_for_task"
+            ok, reason = self.quota.can_reserve(cfg, ctx.est_input_tokens, ctx.est_output_tokens)
+            if not ok:
+                return False, reason
+            if cfg.privacy == "external_paid":
+                gate = self._budget_gate(cfg, ctx)
+                if gate:
+                    return False, gate
         elif self._is_rented(cfg):
             # Rented node: provisioned on demand, so no live ManagerStatus is
             # required at routing time. Enforce trust policy + rental budget.
@@ -308,6 +332,20 @@ class RoutingEngine:
             terms["queue_delay_penalty"] = -min(1.0, queue_wait / 60.0) * w.get("queue_delay_penalty", 1.5)
             terms["cost_penalty"] = 0.0
             terms["opportunity_cost"] = 0.0
+        elif cfg.type == "cli_subprocess":
+            # No metered per-call cost or quota exists for a subscription
+            # CLI -- pinned at 0 explicitly rather than falling into the
+            # generic cloud-shaped `else` branch below, which prices
+            # cost_penalty/quota_scarcity_penalty against a real quota this
+            # provider type doesn't have (see providers.yaml's
+            # `quota.kind: subscription_unmetered`).
+            terms["latency_fit"] = 0.5 * w.get("latency_fit", 1.0)
+            terms["residency_bonus"] = 0.0
+            terms["model_switch_penalty"] = 0.0
+            terms["queue_delay_penalty"] = 0.0
+            terms["cost_penalty"] = 0.0
+            terms["quota_scarcity_penalty"] = 0.0
+            terms["opportunity_cost"] = 0.0
         else:
             terms["latency_fit"] = 0.6 * w.get("latency_fit", 1.0)
             terms["residency_bonus"] = 0.0
@@ -363,7 +401,23 @@ class RoutingEngine:
         rejected: list[RejectedOption] = []
         scores: list[ScoreBreakdown] = []
 
-        for cfg in self.registry.all():
+        if ctx.required_provider is not None:
+            # Pinned dispatch (council orchestrator): short-circuits scoring
+            # competition against every other provider, but eligibility() --
+            # privacy/budget/circuit/quota policy -- still runs unchanged
+            # below. Policy is never bypassed, only the scoring contest is.
+            pinned = self.registry.get(ctx.required_provider)
+            candidates = [pinned] if pinned is not None else []
+            if pinned is None:
+                rejected.append(
+                    RejectedOption(
+                        provider=ctx.required_provider, reason="required_provider_not_found"
+                    )
+                )
+        else:
+            candidates = list(self.registry.all())
+
+        for cfg in candidates:
             eligible, reason = self.eligibility(ctx, cfg, status)
             if not eligible:
                 rejected.append(RejectedOption(provider=cfg.provider_id, reason=reason))
@@ -393,6 +447,8 @@ class RoutingEngine:
             decision = (
                 "route_to_local_resident_model" if not choice.switch_required else "route_to_local_after_switch"
             )
+        elif cfg.type == "cli_subprocess":
+            decision = "route_to_cli_subprocess"
         else:
             decision = "route_to_cloud_provider"
 

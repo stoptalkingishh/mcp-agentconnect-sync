@@ -267,6 +267,7 @@ class RouterService:
                 priority=submission.constraints.priority,
                 quality="high" if submission.constraints.quality == "high" else "standard",
                 cloud_safe=redaction.cloud_safe,
+                required_provider=submission.constraints.required_provider,
             )
             status = self._local_status()
             self._refresh_circuit_state()
@@ -470,6 +471,7 @@ class RouterService:
             priority=submission.constraints.priority,
             quality="high" if submission.constraints.quality == "high" else "standard",
             cloud_safe=redaction.cloud_safe,
+            required_provider=submission.constraints.required_provider,
         )
         state = self._transition(task_id, state, TaskState.ELIGIBLE_PROVIDERS_COMPUTED)
         # Refresh the learned-quality prior from observed outcomes (Phase 6).
@@ -1007,9 +1009,13 @@ class RouterService:
                 "quota_remaining": rem,
             }
             # Circuit breaker state is a cloud-call resilience concept (native
-            # port of OmniRoute's resilience tooling) — only meaningful for
-            # cloud providers, which are the only ones the breaker tracks.
-            if cfg.type == "cloud" and self.circuit_breaker is not None:
+            # port of OmniRoute's resilience tooling) — meaningful for cloud
+            # and cli_subprocess providers (both make an outbound call that
+            # can fail); local/rented nodes have their own admission checks
+            # instead. Breaker recording/enforcement itself (_on_gateway_result,
+            # _refresh_circuit_state) was never type-gated — this only fixes
+            # what the status surface displays.
+            if cfg.type in ("cloud", "cli_subprocess") and self.circuit_breaker is not None:
                 entry["circuit"] = self.circuit_breaker.status(cfg.provider_id)
             out.append(entry)
         return out
