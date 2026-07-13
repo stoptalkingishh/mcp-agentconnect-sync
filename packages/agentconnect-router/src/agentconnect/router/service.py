@@ -24,7 +24,7 @@ from ..common.budget import BudgetManager
 from ..common.circuit_breaker import CircuitBreakerRegistry
 from ..common.compression import Compressor
 from ..common.evaluation import Evaluator
-from ..common.config import ProfilesConfig, RoutingConfig, load_all
+from ..common.config import ProfilesConfig, ProviderConfig, RoutingConfig, load_all
 from ..common.memory import SharedMemory
 from ..common.privacy import ClassificationHints
 from ..common.providers import ProviderRegistry
@@ -48,6 +48,16 @@ from .routing import RoutingContext, RoutingEngine
 
 if TYPE_CHECKING:
     from .provisioning import NodePool, NodeProvisioner
+
+
+def _is_external_provider(cfg: ProviderConfig) -> bool:
+    """Return whether dispatch crosses the machine's trust boundary."""
+    return cfg.type in ("cloud", "cli_subprocess")
+
+
+def _payload_for_provider(cfg: ProviderConfig, original: str, redacted: str) -> str:
+    """Select the sanitized payload for every provider outside the trust boundary."""
+    return redacted if _is_external_provider(cfg) else original
 
 
 @dataclass
@@ -589,7 +599,12 @@ class RouterService:
             request_id=f"req_{uuid.uuid4().hex[:10]}",
             task_id=task_id,
             model_id=decision.selected_model or self.profiles.default_resident_model,
-            messages=[{"role": "user", "content": redacted_text if cfg.type == "cloud" else submission.task}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": _payload_for_provider(cfg, submission.task, redacted_text),
+                }
+            ],
             max_output_tokens=max_out,
             temperature=0.2,
             priority=submission.constraints.priority,
